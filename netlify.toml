@@ -1,0 +1,23 @@
+# Netlify configuration for TunesReloaded
+[build]
+  # No build command needed - static site
+  publish = "."
+
+# Headers for WASM files
+[[headers]]
+  for = "/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+    Cross-Origin-Embedder-Policy = "require-corp"
+    Cross-Origin-Opener-Policy = "same-origin"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Content-Type = "application/javascript"
+
+# Redirect all routes to index.html (for SPA routing if needed)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

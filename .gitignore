@@ -1,0 +1,21 @@
+# Build artifacts (optional - you may want to commit these)
+# ipod_manager.js
+# ipod_manager.wasm
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local

@@ -7,16 +7,17 @@
 // Global State
 // ============================================================================
 
-let ipodHandle = null;          // FileSystemDirectoryHandle for iPod
+let ipodHandle = null;
 let isConnected = false;
 let allTracks = [];
 let allPlaylists = [];
 let currentPlaylistIndex = -1;  // -1 means "All Tracks"
 let logEntries = [];
 let wasmReady = false;
+let Module = null;
 
 // ============================================================================
-// Logging Functions
+// Logging
 // ============================================================================
 
 function log(message, type = 'info') {
@@ -35,7 +36,6 @@ function log(message, type = 'info') {
 
     logCount.textContent = `(${logEntries.length})`;
 
-    // Also log to browser console
     const consoleFn = type === 'error' ? console.error : type === 'warning' ? console.warn : console.log;
     consoleFn(`[TunesReloaded] ${message}`);
 }
@@ -55,17 +55,12 @@ function toggleLogPanel() {
 }
 
 // ============================================================================
-// WASM Module Interface
+// WASM Interface - Core Functions
 // ============================================================================
 
-// Module will be set when WASM loads
-let Module = null;
-
-// Initialize WASM module
 async function initWasm() {
     log('Loading WASM module...');
     try {
-        // createIPodModule is defined in ipod_manager.js (emscripten output)
         Module = await createIPodModule({
             print: (text) => log(text, 'info'),
             printErr: (text) => log(text, 'error'),
@@ -78,13 +73,11 @@ async function initWasm() {
     }
 }
 
-// Wrapper functions for WASM calls
 function wasmCall(funcName, ...args) {
     if (!wasmReady) {
         log(`WASM not ready, cannot call ${funcName}`, 'error');
         return null;
     }
-
     try {
         const func = Module[`_${funcName}`];
         if (!func) {
@@ -99,8 +92,7 @@ function wasmCall(funcName, ...args) {
 }
 
 function wasmGetString(ptr) {
-    if (!ptr) return null;
-    return Module.UTF8ToString(ptr);
+    return ptr ? Module.UTF8ToString(ptr) : null;
 }
 
 function wasmAllocString(str) {
@@ -115,33 +107,84 @@ function wasmFreeString(ptr) {
 }
 
 // ============================================================================
-// File System Access API
+// WASM Interface - Helper Functions (DRY)
 // ============================================================================
+
+/**
+ * Call WASM function with string parameters, automatically managing memory
+ * @param {string} funcName - WASM function name (without _ prefix)
+ * @param {Array} stringArgs - Array of string arguments
+ * @param {Array} otherArgs - Array of non-string arguments
+ * @returns {*} Function result
+ */
+function wasmCallWithStrings(funcName, stringArgs = [], otherArgs = []) {
+    const stringPtrs = stringArgs.map(wasmAllocString);
+    try {
+        return wasmCall(funcName, ...stringPtrs, ...otherArgs);
+    } finally {
+        stringPtrs.forEach(wasmFreeString);
+    }
+}
+
+/**
+ * Get JSON from WASM function and parse it
+ * @param {string} funcName - WASM function name
+ * @param {...*} args - Arguments to pass to WASM function
+ * @returns {Object|Array|null} Parsed JSON or null on error
+ */
+function wasmGetJson(funcName, ...args) {
+    const jsonPtr = wasmCall(funcName, ...args);
+    if (!jsonPtr) return null;
+    
+    const jsonStr = wasmGetString(jsonPtr);
+    wasmCall('ipod_free_string', jsonPtr);
+    
+    if (!jsonStr) return null;
+    
+    try {
+        return JSON.parse(jsonStr);
+    } catch (e) {
+        log(`Failed to parse JSON from ${funcName}: ${e.message}`, 'error');
+        return null;
+    }
+}
+
+/**
+ * Call WASM function and handle errors
+ * @param {string} funcName - WASM function name
+ * @param {...*} args - Arguments
+ * @returns {number} Result code (0 = success, <0 = error)
+ */
+function wasmCallWithError(funcName, ...args) {
+    const result = wasmCall(funcName, ...args);
+    if (result !== 0 && result !== null) {
+        const errorPtr = wasmCall('ipod_get_last_error');
+        const error = wasmGetString(errorPtr);
+        log(`WASM error (${funcName}): ${error || 'Unknown error'}`, 'error');
+    }
+    return result;
+}
+
+// ============================================================================
+// File System Operations
+// ============================================================================
+
+const MOUNTPOINT = '/iPod';
 
 async function selectIpodFolder() {
     try {
         log('Opening folder picker...');
-
-        // Request directory access
-        const handle = await window.showDirectoryPicker({
-            mode: 'readwrite'
-        });
-
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
         ipodHandle = handle;
         log(`Selected folder: ${handle.name}`, 'success');
 
-        // Verify this looks like an iPod
         const isValid = await verifyIpodStructure(handle);
         if (!isValid) {
             log('Warning: This folder may not be an iPod. Looking for iPod_Control folder...', 'warning');
         }
 
-        // Set up virtual filesystem for WASM
         await setupWasmFilesystem(handle);
-
-        // Parse the database
         await parseDatabase();
-
     } catch (e) {
         if (e.name === 'AbortError') {
             log('Folder selection cancelled', 'warning');
@@ -153,18 +196,10 @@ async function selectIpodFolder() {
 
 async function verifyIpodStructure(handle) {
     try {
-        // Check for iPod_Control folder
         const controlDir = await handle.getDirectoryHandle('iPod_Control', { create: false });
-        log('Found iPod_Control directory', 'success');
-
-        // Check for iTunes folder
         const itunesDir = await controlDir.getDirectoryHandle('iTunes', { create: false });
-        log('Found iTunes directory', 'success');
-
-        // Check for iTunesDB
-        const itunesDB = await itunesDir.getFileHandle('iTunesDB', { create: false });
-        log('Found iTunesDB file', 'success');
-
+        await itunesDir.getFileHandle('iTunesDB', { create: false });
+        log('Found iPod_Control directory', 'success');
         return true;
     } catch (e) {
         return false;
@@ -174,96 +209,72 @@ async function verifyIpodStructure(handle) {
 async function setupWasmFilesystem(handle) {
     log('Setting up virtual filesystem for WASM...');
 
-    // For Emscripten, we need to mount the filesystem
-    // The mountpoint will be /ipod in the virtual FS
+    // Create mountpoint
+    try { Module.FS.mkdir(MOUNTPOINT); } catch (e) {}
 
-    const mountpoint = '/iPod';
+    // Set mountpoint in WASM
+    wasmCallWithStrings('ipod_set_mountpoint', [MOUNTPOINT]);
 
-    // Create the mount point directory
-    try {
-        Module.FS.mkdir(mountpoint);
-    } catch (e) {
-        // Directory might already exist
+    // Create directory structure
+    const dirs = [
+        `${MOUNTPOINT}/iPod_Control`,
+        `${MOUNTPOINT}/iPod_Control/iTunes`,
+        `${MOUNTPOINT}/iPod_Control/Device`,
+        `${MOUNTPOINT}/iPod_Control/Music`
+    ];
+    dirs.forEach(dir => { try { Module.FS.mkdir(dir); } catch (e) {} });
+
+    // Create Music subfolders F00-F49
+    for (let i = 0; i < 50; i++) {
+        const folder = `F${String(i).padStart(2, '0')}`;
+        try { Module.FS.mkdir(`${MOUNTPOINT}/iPod_Control/Music/${folder}`); } catch (e) {}
     }
 
-    // Mount IDBFS or NODEFS depending on environment
-    // For web, we'll use a custom approach: read files on demand
-
-    // Set the mountpoint in WASM
-    const mpPtr = wasmAllocString(mountpoint);
-    wasmCall('ipod_set_mountpoint', mpPtr);
-    wasmFreeString(mpPtr);
-
-    // Sync the iPod files to the virtual filesystem
-    await syncIpodToVirtualFS(handle, mountpoint);
-
+    await syncIpodToVirtualFS(handle);
     log('Virtual filesystem ready', 'success');
 }
 
-async function syncIpodToVirtualFS(handle, mountpoint) {
+async function syncIpodToVirtualFS(handle) {
     log('Syncing iPod files to virtual filesystem...');
 
-    // Recursively copy directory structure
-    await syncDirectory(handle, mountpoint);
-
-    log('File sync complete', 'success');
-}
-
-async function syncDirectory(dirHandle, virtualPath) {
-    // Only create directory if it doesn't exist (silently)
     try {
-        Module.FS.mkdir(virtualPath);
-    } catch (e) {
-        // Directory exists - that's fine
-    }
+        const iPodControlHandle = await handle.getDirectoryHandle('iPod_Control');
+        const iTunesHandle = await iPodControlHandle.getDirectoryHandle('iTunes');
+        
+        // Copy iTunesDB
+        const dbFileHandle = await iTunesHandle.getFileHandle('iTunesDB');
+        const dbFile = await dbFileHandle.getFile();
+        const dbData = new Uint8Array(await dbFile.arrayBuffer());
+        Module.FS.writeFile(`${MOUNTPOINT}/iPod_Control/iTunes/iTunesDB`, dbData);
+        log(`Synced: iTunesDB (${dbData.length} bytes)`, 'info');
 
-    for await (const [name, handle] of dirHandle.entries()) {
-        const childPath = `${virtualPath}/${name}`;
-
-        if (handle.kind === 'directory') {
-            // Only sync directories that contain database/config files
-            // We DON'T sync Music or Artwork - those contain large files we don't need in RAM
-            // libgpod only needs iTunesDB and device info files
-            if (name === 'iPod_Control') {
-                await syncDirectory(handle, childPath);
-            } else if (name === 'iTunes' || name === 'Device') {
-                // Sync iTunes (has iTunesDB) and Device (has device info)
-                await syncDirectory(handle, childPath);
-            }
-            // Skip Music, Artwork, and all other directories - we don't need them in virtual FS
-        } else if (handle.kind === 'file') {
-            // Only sync small database/config files to virtual FS
-            // DO NOT sync audio files or artwork - they're huge and not needed in RAM
-            // libgpod only needs the database files to read track metadata
-            const lowerName = name.toLowerCase();
-            const isItunesFile = lowerName.startsWith('itunes') || lowerName.startsWith('itunesdb');
-            const isDeviceFile = name === 'DeviceInfo' || name === 'SysInfo' || name === 'SysInfoExtended';
-            
-            // Only sync iTunes database/config files and device info files
-            // Audio files are handled separately when uploading, and we read them
-            // directly from the real filesystem, not from virtual FS
-            if (isItunesFile || isDeviceFile) {
-                if (virtualPath.includes('iTunes')) {
-                    log(`Found file in iTunes: ${name}`, 'info');
-                }
-                await syncFile(handle, childPath);
-            }
-            // Skip audio files and artwork - they don't need to be in RAM
+        // Copy SysInfo and SysInfoExtended
+        try {
+            const deviceHandle = await iPodControlHandle.getDirectoryHandle('Device');
+            await copyDeviceFile(deviceHandle, 'SysInfo');
+            await copyDeviceFile(deviceHandle, 'SysInfoExtended');
+        } catch (e) {
+            log(`Device directory error: ${e.message}`, 'warning');
         }
+
+        log('File sync complete', 'success');
+    } catch (e) {
+        log(`Error syncing files: ${e.message}`, 'error');
+        throw e;
     }
 }
 
-async function syncFile(fileHandle, virtualPath) {
+async function copyDeviceFile(deviceHandle, filename) {
     try {
+        const fileHandle = await deviceHandle.getFileHandle(filename);
         const file = await fileHandle.getFile();
-        const buffer = await file.arrayBuffer();
-        const data = new Uint8Array(buffer);
-
-        // Write to virtual filesystem
-        Module.FS.writeFile(virtualPath, data);
-        log(`Synced: ${virtualPath}`, 'info');
+        const data = new Uint8Array(await file.arrayBuffer());
+        Module.FS.writeFile(`${MOUNTPOINT}/iPod_Control/Device/${filename}`, data);
+        log(`Synced: ${filename} (${data.length} bytes)`, 'info');
     } catch (e) {
-        log(`Failed to sync ${virtualPath}: ${e.message}`, 'warning');
+        if (filename === 'SysInfo') {
+            log(`SysInfo file not found: ${e.message}`, 'warning');
+        }
     }
 }
 
@@ -273,138 +284,107 @@ async function syncFile(fileHandle, virtualPath) {
 
 async function parseDatabase() {
     log('Parsing iTunesDB...');
-
-    const result = wasmCall('ipod_parse_db');
-
-    if (result !== 0) {
-        const errorPtr = wasmCall('ipod_get_last_error');
-        const error = wasmGetString(errorPtr);
-        log(`Failed to parse database: ${error}`, 'error');
-        return;
-    }
+    const result = wasmCallWithError('ipod_parse_db');
+    if (result !== 0) return;
 
     isConnected = true;
     updateConnectionStatus(true);
     enableUIIfReady();
 
-    // Load device info
-    loadDeviceInfo();
-
-    // Load tracks and playlists
     await loadTracks();
     await loadPlaylists();
-
     log('Database loaded successfully', 'success');
-}
-
-function loadDeviceInfo() {
-    const jsonPtr = wasmCall('ipod_get_device_info_json');
-    if (!jsonPtr) return;
-
-    const jsonStr = wasmGetString(jsonPtr);
-    wasmCall('ipod_free_string', jsonPtr);
-
-    try {
-        const info = JSON.parse(jsonStr);
-
-        document.getElementById('deviceInfo').style.display = 'block';
-        document.getElementById('deviceModel').textContent = info.model_name || 'iPod';
-        document.getElementById('deviceGen').textContent = `Generation: ${info.generation}`;
-        document.getElementById('deviceCapacity').textContent = `Capacity: ${info.capacity}GB`;
-        document.getElementById('deviceTracks').textContent = `Tracks: ${info.track_count}`;
-
-        log(`Device: ${info.model_name} (${info.generation})`, 'info');
-    } catch (e) {
-        log(`Failed to parse device info: ${e.message}`, 'warning');
-    }
 }
 
 async function loadTracks() {
     log('Loading tracks...');
-
-    const jsonPtr = wasmCall('ipod_get_all_tracks_json');
-    if (!jsonPtr) {
-        log('Failed to get tracks', 'error');
-        return;
-    }
-
-    const jsonStr = wasmGetString(jsonPtr);
-    wasmCall('ipod_free_string', jsonPtr);
-
-    try {
-        allTracks = JSON.parse(jsonStr);
-        log(`Loaded ${allTracks.length} tracks`, 'success');
-        renderTracks(allTracks);
-    } catch (e) {
-        log(`Failed to parse tracks: ${e.message}`, 'error');
+    const tracks = wasmGetJson('ipod_get_all_tracks_json');
+    if (tracks) {
+        allTracks = tracks;
+        log(`Loaded ${tracks.length} tracks`, 'success');
+        renderTracks(tracks);
     }
 }
 
 async function loadPlaylists() {
     log('Loading playlists...');
+    const playlists = wasmGetJson('ipod_get_all_playlists_json');
+    if (playlists) {
+        allPlaylists = playlists;
+        log(`Loaded ${playlists.length} playlists`, 'success');
+        renderPlaylists(playlists);
+    }
+}
 
-    const jsonPtr = wasmCall('ipod_get_all_playlists_json');
-    if (!jsonPtr) {
-        log('Failed to get playlists', 'error');
+async function loadPlaylistTracks(index) {
+    if (index < 0 || index >= allPlaylists.length) {
+        log(`Invalid playlist index: ${index}`, 'error');
         return;
     }
-
-    const jsonStr = wasmGetString(jsonPtr);
-    wasmCall('ipod_free_string', jsonPtr);
-
-    try {
-        allPlaylists = JSON.parse(jsonStr);
-        log(`Loaded ${allPlaylists.length} playlists`, 'success');
-        renderPlaylists(allPlaylists);
-    } catch (e) {
-        log(`Failed to parse playlists: ${e.message}`, 'error');
+    
+    const playlistName = allPlaylists[index].name;
+    log(`Loading tracks for playlist: "${playlistName}"`, 'info');
+    
+    const tracks = wasmGetJson('ipod_get_playlist_tracks_json', index);
+    if (tracks) {
+        log(`Loaded ${tracks.length} tracks for playlist "${playlistName}"`, 'info');
+        renderTracks(tracks);
     }
 }
 
 async function saveDatabase() {
     log('Saving database...');
-
-    // First, sync virtual FS back to real FS
     await syncVirtualFSToIpod();
 
-    const result = wasmCall('ipod_write_db');
+    const result = wasmCallWithError('ipod_write_db');
+    if (result !== 0) return;
 
-    if (result !== 0) {
-        const errorPtr = wasmCall('ipod_get_last_error');
-        const error = wasmGetString(errorPtr);
-        log(`Failed to save database: ${error}`, 'error');
-        return;
-    }
-
-    // Sync the written files back to the real filesystem
     await syncVirtualFSToIpod();
-
+    await refreshCurrentView();
     log('Database saved successfully', 'success');
 }
 
+// ============================================================================
+// UI Refresh Helpers (DRY)
+// ============================================================================
+
+async function refreshCurrentView() {
+    await loadPlaylists();
+    if (currentPlaylistIndex === -1) {
+        await loadTracks();
+    } else if (currentPlaylistIndex >= 0 && currentPlaylistIndex < allPlaylists.length) {
+        await loadPlaylistTracks(currentPlaylistIndex);
+    } else {
+        currentPlaylistIndex = -1;
+        await loadTracks();
+    }
+}
+
+async function refreshTracks() {
+    const savedPlaylistIndex = currentPlaylistIndex;
+    await loadPlaylists();
+    currentPlaylistIndex = savedPlaylistIndex;
+    await refreshCurrentView();
+    log('Refreshed track list', 'info');
+}
+
+// ============================================================================
+// File Sync Operations
+// ============================================================================
+
 async function syncVirtualFSToIpod() {
     if (!ipodHandle) return;
-
     log('Syncing changes to iPod...');
 
-    // Read modified files from virtual FS and write to real FS
-    // Use /iPod (capital I) to match the mountpoint
     try {
-        // Sync iTunesDB
-        await syncVirtualFileToReal('/iPod/iPod_Control/iTunes/iTunesDB',
+        await syncVirtualFileToReal(`${MOUNTPOINT}/iPod_Control/iTunes/iTunesDB`,
             ['iPod_Control', 'iTunes'], 'iTunesDB');
-
-        // Sync iTunesSD if it exists (optional file - not all iPods have it)
-        await syncVirtualFileToReal('/iPod/iPod_Control/iTunes/iTunesSD',
+        await syncVirtualFileToReal(`${MOUNTPOINT}/iPod_Control/iTunes/iTunesSD`,
             ['iPod_Control', 'iTunes'], 'iTunesSD', true);
-
-        // Sync uploaded music files from virtual FS to real FS
         await syncMusicFilesToReal();
-
         log('Sync complete', 'success');
     } catch (e) {
-        const errorMsg = e.message || e.toString() || 'Unknown error';
-        log(`Sync error: ${errorMsg}`, 'error');
+        log(`Sync error: ${e.message || e.toString() || 'Unknown error'}`, 'error');
     }
 }
 
@@ -412,31 +392,25 @@ async function syncMusicFilesToReal() {
     if (!ipodHandle) return;
 
     try {
-        const vfsMusicPath = '/iPod/iPod_Control/Music';
-        
-        // Check if Music directory exists in virtual FS
+        const vfsMusicPath = `${MOUNTPOINT}/iPod_Control/Music`;
         let folders;
         try {
             folders = Module.FS.readdir(vfsMusicPath).filter(f => f.match(/^F\d{2}$/i));
         } catch (e) {
-            // No Music directory or no folders yet
             return;
         }
 
         if (folders.length === 0) return;
 
-        // Get Music directory handle on real iPod
         const iPodControlHandle = await ipodHandle.getDirectoryHandle('iPod_Control', { create: true });
         const musicHandle = await iPodControlHandle.getDirectoryHandle('Music', { create: true });
 
-        // Sync each F## folder
         for (const folder of folders) {
             const folderPath = `${vfsMusicPath}/${folder}`;
             let files;
             try {
                 files = Module.FS.readdir(folderPath).filter(f => 
-                    f.endsWith('.mp3') || f.endsWith('.m4a') || 
-                    f.endsWith('.aac') || f.endsWith('.wav') || f.endsWith('.aiff')
+                    /\.(mp3|m4a|aac|wav|aiff)$/i.test(f)
                 );
             } catch (e) {
                 continue;
@@ -444,49 +418,37 @@ async function syncMusicFilesToReal() {
 
             if (files.length === 0) continue;
 
-            // Create folder on real iPod
             const realFolderHandle = await musicHandle.getDirectoryHandle(folder, { create: true });
 
-            // Sync each file
             for (const file of files) {
                 const filePath = `${folderPath}/${file}`;
                 try {
-                    // Check if file already exists on real iPod
                     try {
                         await realFolderHandle.getFileHandle(file);
-                        // File already exists, skip
-                        continue;
-                    } catch (e) {
-                        // File doesn't exist, copy it
-                    }
+                        continue; // File already exists
+                    } catch (e) {}
 
-                    // Read from virtual FS and write to real FS
                     const fileData = Module.FS.readFile(filePath);
                     const fileHandle = await realFolderHandle.getFileHandle(file, { create: true });
                     const writable = await fileHandle.createWritable();
                     await writable.write(fileData);
                     await writable.close();
-                    
                     log(`Synced music file: ${folder}/${file}`, 'info');
                 } catch (e) {
-                    const errorMsg = e.message || e.toString() || 'Unknown error';
-                    log(`Could not sync ${folder}/${file}: ${errorMsg}`, 'warning');
+                    log(`Could not sync ${folder}/${file}: ${e.message}`, 'warning');
                 }
             }
         }
     } catch (e) {
-        const errorMsg = e.message || e.toString() || 'Unknown error';
-        log(`Error syncing music files: ${errorMsg}`, 'warning');
+        log(`Error syncing music files: ${e.message}`, 'warning');
     }
 }
 
 async function syncVirtualFileToReal(virtualPath, dirPath, fileName, optional = false) {
     try {
-        // Check if file exists in virtual FS
         try {
             Module.FS.stat(virtualPath);
         } catch (e) {
-            // Only log warning if file is required (not optional)
             if (!optional) {
                 log(`File not found in virtual FS: ${virtualPath}`, 'warning');
             }
@@ -494,25 +456,19 @@ async function syncVirtualFileToReal(virtualPath, dirPath, fileName, optional = 
         }
 
         const data = Module.FS.readFile(virtualPath);
-
-        // Navigate to the directory
         let currentDir = ipodHandle;
         for (const dir of dirPath) {
             currentDir = await currentDir.getDirectoryHandle(dir, { create: true });
         }
 
-        // Write the file
         const fileHandle = await currentDir.getFileHandle(fileName, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(data);
         await writable.close();
-
         log(`Synced ${fileName} to iPod`, 'info');
     } catch (e) {
-        const errorMsg = e.message || e.toString() || 'Unknown error';
-        // Only log warning if file is required (not optional)
         if (!optional) {
-            log(`Failed to sync ${fileName}: ${errorMsg}`, 'warning');
+            log(`Failed to sync ${fileName}: ${e.message}`, 'warning');
         }
     }
 }
@@ -527,34 +483,24 @@ async function uploadTracks() {
             multiple: true,
             types: [{
                 description: 'Audio Files',
-                accept: {
-                    'audio/*': ['.mp3', '.m4a', '.aac', '.wav', '.aiff']
-                }
+                accept: { 'audio/*': ['.mp3', '.m4a', '.aac', '.wav', '.aiff'] }
             }]
         });
 
         if (fileHandles.length === 0) return;
-
         log(`Selected ${fileHandles.length} files for upload`, 'info');
 
         document.getElementById('uploadModal').classList.add('show');
 
         for (let i = 0; i < fileHandles.length; i++) {
-            const fileHandle = fileHandles[i];
-            const file = await fileHandle.getFile();
-
+            const file = await fileHandles[i].getFile();
             updateUploadProgress(i + 1, fileHandles.length, file.name);
-
             await uploadSingleTrack(file);
         }
 
         document.getElementById('uploadModal').classList.remove('show');
-
-        // Refresh track list
-        await loadTracks();
-
+        await refreshCurrentView();
         log(`Upload complete: ${fileHandles.length} tracks`, 'success');
-
     } catch (e) {
         document.getElementById('uploadModal').classList.remove('show');
         if (e.name !== 'AbortError') {
@@ -566,60 +512,18 @@ async function uploadTracks() {
 async function uploadSingleTrack(file) {
     log(`Uploading: ${file.name}`);
 
-    // Extract basic metadata from filename
-    let title = file.name.replace(/\.[^/.]+$/, ''); // Remove extension
-    let artist = 'Unknown Artist';
-    let album = 'Unknown Album';
-
-    // Try to parse "Artist - Title" format
-    const match = title.match(/^(.+?)\s*-\s*(.+)$/);
-    if (match) {
-        artist = match[1].trim();
-        title = match[2].trim();
-    }
-
-    // Get file info
+    const tags = await readAudioTags(file);
+    const audioProps = await getAudioProperties(file);
     const buffer = await file.arrayBuffer();
     const data = new Uint8Array(buffer);
-    const size = data.length;
 
-    // Estimate duration and bitrate (rough estimate for MP3)
-    // A proper implementation would parse the actual audio headers
-    const bitrate = 192; // Assume 192kbps
-    const duration = Math.floor((size * 8) / (bitrate * 1000)) * 1000; // ms
-
-    // Determine filetype
-    let filetype = 'MPEG audio file';
-    if (file.name.endsWith('.m4a') || file.name.endsWith('.aac')) {
-        filetype = 'AAC audio file';
-    } else if (file.name.endsWith('.wav')) {
-        filetype = 'WAV audio file';
-    }
+    const filetype = getFiletypeFromName(file.name);
 
     // Add track to database
-    const titlePtr = wasmAllocString(title);
-    const artistPtr = wasmAllocString(artist);
-    const albumPtr = wasmAllocString(album);
-    const genrePtr = wasmAllocString('');
-    const filetypePtr = wasmAllocString(filetype);
-
-    const trackId = wasmCall('ipod_add_track',
-        titlePtr, artistPtr, albumPtr, genrePtr,
-        0, // track_nr
-        0, // cd_nr
-        0, // year
-        duration,
-        bitrate,
-        44100, // samplerate
-        size,
-        filetypePtr
+    const trackId = wasmCallWithStrings('ipod_add_track',
+        [tags.title, tags.artist, tags.album, tags.genre || '', filetype],
+        [tags.track || 0, 0, tags.year || 0, audioProps.duration, audioProps.bitrate, audioProps.samplerate, data.length]
     );
-
-    wasmFreeString(titlePtr);
-    wasmFreeString(artistPtr);
-    wasmFreeString(albumPtr);
-    wasmFreeString(genrePtr);
-    wasmFreeString(filetypePtr);
 
     if (trackId < 0) {
         const errorPtr = wasmCall('ipod_get_last_error');
@@ -628,10 +532,7 @@ async function uploadSingleTrack(file) {
     }
 
     // Get destination path
-    const filenamePtr = wasmAllocString(file.name);
-    const destPathPtr = wasmCall('ipod_get_track_dest_path', filenamePtr);
-    wasmFreeString(filenamePtr);
-
+    const destPathPtr = wasmCallWithStrings('ipod_get_track_dest_path', [file.name]);
     if (!destPathPtr) {
         log('Failed to get destination path', 'error');
         return;
@@ -640,42 +541,114 @@ async function uploadSingleTrack(file) {
     const destPath = wasmGetString(destPathPtr);
     wasmCall('ipod_free_string', destPathPtr);
 
-    // Convert iPod path to filesystem path
-    const fsPath = destPath.replace(/:/g, '/');
+    // Write to virtual FS
+    await copyFileToVirtualFS(data, destPath);
 
-    // Write file to virtual FS only (fast - just RAM)
-    // Real FS write happens later when user clicks "Save"
-    await copyFileToVirtualFS(data, fsPath);
+    // Finalize track
+    const finalizePathPtr = wasmAllocString(destPath);
+    const result = wasmCallWithError('ipod_track_finalize', trackId, finalizePathPtr);
+    wasmFreeString(finalizePathPtr);
 
-    // Update track with path
-    const pathPtr = wasmAllocString(destPath);
-    wasmCall('ipod_track_set_path', trackId, pathPtr);
-    wasmFreeString(pathPtr);
+    if (result !== 0) {
+        // Fallback: manual path setting
+        const ipodPath = destPath.replace(/^\/iPod\//, '').replace(/\//g, ':');
+        wasmCallWithStrings('ipod_track_set_path', [ipodPath], [trackId]);
+    }
 
-    log(`Uploaded: ${title} (ID: ${trackId})`, 'success');
+    // Add to current playlist if one is selected
+    if (currentPlaylistIndex >= 0 && currentPlaylistIndex < allPlaylists.length) {
+        const addResult = wasmCall('ipod_playlist_add_track', currentPlaylistIndex, trackId);
+        if (addResult === 0) {
+            log(`Added track to playlist: ${allPlaylists[currentPlaylistIndex].name}`, 'info');
+        }
+    }
+
+    log(`Uploaded: ${tags.title} (ID: ${trackId})`, 'success');
 }
 
-async function copyFileToVirtualFS(data, fsPath) {
-    // Write to virtual FS only (fast - just RAM)
-    // Real FS sync happens when user saves
-    const virtualPath = '/iPod' + fsPath;
+function getFiletypeFromName(filename) {
+    const lower = filename.toLowerCase();
+    if (lower.endsWith('.m4a') || lower.endsWith('.aac')) return 'AAC audio file';
+    if (lower.endsWith('.wav')) return 'WAV audio file';
+    if (lower.endsWith('.aiff') || lower.endsWith('.aif')) return 'AIFF audio file';
+    return 'MPEG audio file';
+}
+
+async function copyFileToVirtualFS(data, virtualPath) {
     try {
-        // Parse path and create directories
-        const parts = fsPath.split('/').filter(p => p);
-        let dirPath = '/iPod';
+        const parts = virtualPath.split('/').filter(p => p);
+        let dirPath = '';
         for (let i = 0; i < parts.length - 1; i++) {
             dirPath += '/' + parts[i];
-            try { 
-                Module.FS.mkdir(dirPath); 
-            } catch (e) {
-                // Directory might already exist
-            }
+            try { Module.FS.mkdir(dirPath); } catch (e) {}
         }
         Module.FS.writeFile(virtualPath, data);
     } catch (e) {
-        const errorMsg = e.message || e.toString() || 'Unknown error';
-        log(`Virtual FS write warning: ${errorMsg}`, 'warning');
+        log(`Virtual FS write warning: ${e.message}`, 'warning');
     }
+}
+
+function readAudioTags(file) {
+    return new Promise((resolve) => {
+        if (typeof jsmediatags === 'undefined') {
+            resolve({
+                title: file.name.replace(/\.[^/.]+$/, ''),
+                artist: 'Unknown Artist',
+                album: 'Unknown Album',
+                genre: '',
+                track: 0,
+                year: 0,
+            });
+            return;
+        }
+
+        jsmediatags.read(file, {
+            onSuccess: (tag) => {
+                const tags = tag.tags;
+                resolve({
+                    title: tags.title || file.name.replace(/\.[^/.]+$/, ''),
+                    artist: tags.artist || 'Unknown Artist',
+                    album: tags.album || 'Unknown Album',
+                    genre: tags.genre || '',
+                    track: tags.track ? parseInt(tags.track) : 0,
+                    year: tags.year ? parseInt(tags.year) : 0,
+                });
+            },
+            onError: () => {
+                const title = file.name.replace(/\.[^/.]+$/, '');
+                const match = title.match(/^(.+?)\s*-\s*(.+)$/);
+                resolve({
+                    title: match ? match[2].trim() : title,
+                    artist: match ? match[1].trim() : 'Unknown Artist',
+                    album: 'Unknown Album',
+                    genre: '',
+                    track: 0,
+                    year: 0,
+                });
+            }
+        });
+    });
+}
+
+async function getAudioProperties(file) {
+    return new Promise((resolve) => {
+        const audio = new Audio();
+        audio.preload = 'metadata';
+        
+        audio.onloadedmetadata = () => {
+            const duration = Math.floor(audio.duration * 1000);
+            const bitrate = Math.floor((file.size * 8) / audio.duration / 1000);
+            URL.revokeObjectURL(audio.src);
+            resolve({ duration, bitrate: bitrate || 128, samplerate: 44100 });
+        };
+        
+        audio.onerror = () => {
+            URL.revokeObjectURL(audio.src);
+            resolve({ duration: 180000, bitrate: 192, samplerate: 44100 });
+        };
+        
+        audio.src = URL.createObjectURL(file);
+    });
 }
 
 function updateUploadProgress(current, total, filename) {
@@ -709,15 +682,10 @@ dropZone.addEventListener('drop', async (e) => {
         return;
     }
 
-    const files = [];
-    for (const item of e.dataTransfer.items) {
-        if (item.kind === 'file') {
-            const file = item.getAsFile();
-            if (file && isAudioFile(file.name)) {
-                files.push(file);
-            }
-        }
-    }
+    const files = Array.from(e.dataTransfer.items)
+        .filter(item => item.kind === 'file')
+        .map(item => item.getAsFile())
+        .filter(file => file && isAudioFile(file.name));
 
     if (files.length === 0) {
         log('No audio files found in drop', 'warning');
@@ -725,7 +693,6 @@ dropZone.addEventListener('drop', async (e) => {
     }
 
     log(`Dropped ${files.length} files`, 'info');
-
     document.getElementById('uploadModal').classList.add('show');
 
     for (let i = 0; i < files.length; i++) {
@@ -734,7 +701,7 @@ dropZone.addEventListener('drop', async (e) => {
     }
 
     document.getElementById('uploadModal').classList.remove('show');
-    await loadTracks();
+    await refreshCurrentView();
 });
 
 function isAudioFile(filename) {
@@ -766,7 +733,7 @@ function renderTracks(tracks) {
     emptyState.style.display = 'none';
 
     tbody.innerHTML = tracks.map((track, index) => `
-        <tr data-id="${track.id}">
+        <tr data-id="${track.id}" data-track-id="${track.id}">
             <td>${index + 1}</td>
             <td class="title">${escapeHtml(track.title || 'Unknown')}</td>
             <td>${escapeHtml(track.artist || 'Unknown')}</td>
@@ -780,12 +747,14 @@ function renderTracks(tracks) {
             </td>
         </tr>
     `).join('');
+    
+    // Attach context menu handlers to track rows
+    attachTrackContextMenus();
 }
 
 function renderPlaylists(playlists) {
     const list = document.getElementById('playlistList');
 
-    // Add "All Tracks" option
     let html = `
         <li class="playlist-item ${currentPlaylistIndex === -1 ? 'active' : ''}"
             onclick="selectPlaylist(-1)">
@@ -794,22 +763,25 @@ function renderPlaylists(playlists) {
         </li>
     `;
 
-    html += playlists.map((pl, index) => {
-        let icon = '📁';
-        if (pl.is_master) icon = '🏠';
-        else if (pl.is_podcast) icon = '🎙️';
-        else if (pl.is_smart) icon = '⚡';
-
-        return `
-            <li class="playlist-item ${currentPlaylistIndex === index ? 'active' : ''}"
-                onclick="selectPlaylist(${index})">
-                <span>${icon} ${escapeHtml(pl.name)}</span>
-                <span class="track-count">${pl.track_count}</span>
-            </li>
-        `;
-    }).join('');
+    html += playlists
+        .filter(pl => !pl.is_master)
+        .map((pl, displayIndex, filtered) => {
+            const actualIndex = playlists.indexOf(pl);
+            const icon = pl.is_podcast ? '🎙️' : pl.is_smart ? '⚡' : '📁';
+            return `
+                <li class="playlist-item ${currentPlaylistIndex === actualIndex ? 'active' : ''}"
+                    data-playlist-index="${actualIndex}"
+                    onclick="selectPlaylist(${actualIndex})">
+                    <span>${icon} ${escapeHtml(pl.name)}</span>
+                    <span class="track-count">${pl.track_count}</span>
+                </li>
+            `;
+        }).join('');
 
     list.innerHTML = html;
+    
+    // Attach context menu handlers to playlist items
+    attachPlaylistContextMenus();
 }
 
 function selectPlaylist(index) {
@@ -820,24 +792,6 @@ function selectPlaylist(index) {
         renderTracks(allTracks);
     } else {
         loadPlaylistTracks(index);
-    }
-}
-
-async function loadPlaylistTracks(index) {
-    const jsonPtr = wasmCall('ipod_get_playlist_tracks_json', index);
-    if (!jsonPtr) {
-        log('Failed to get playlist tracks', 'error');
-        return;
-    }
-
-    const jsonStr = wasmGetString(jsonPtr);
-    wasmCall('ipod_free_string', jsonPtr);
-
-    try {
-        const tracks = JSON.parse(jsonStr);
-        renderTracks(tracks);
-    } catch (e) {
-        log(`Failed to parse playlist tracks: ${e.message}`, 'error');
     }
 }
 
@@ -870,12 +824,6 @@ function filterTracks() {
     renderTracks(filtered);
 }
 
-async function refreshTracks() {
-    await loadTracks();
-    await loadPlaylists();
-    log('Refreshed track list', 'info');
-}
-
 // ============================================================================
 // Playlist Management
 // ============================================================================
@@ -897,10 +845,7 @@ function createPlaylist() {
         return;
     }
 
-    const namePtr = wasmAllocString(name);
-    const result = wasmCall('ipod_create_playlist', namePtr);
-    wasmFreeString(namePtr);
-
+    const result = wasmCallWithStrings('ipod_create_playlist', [name]);
     if (result < 0) {
         const errorPtr = wasmCall('ipod_get_last_error');
         log(`Failed to create playlist: ${wasmGetString(errorPtr)}`, 'error');
@@ -912,26 +857,368 @@ function createPlaylist() {
     log(`Created playlist: ${name}`, 'success');
 }
 
+/**
+ * Delete a playlist by index
+ * Cannot delete the master playlist
+ */
+async function deletePlaylist(playlistIndex) {
+    if (playlistIndex < 0 || playlistIndex >= allPlaylists.length) {
+        log('Invalid playlist index', 'error');
+        return;
+    }
+
+    const playlist = allPlaylists[playlistIndex];
+    if (playlist.is_master) {
+        log('Cannot delete master playlist', 'warning');
+        return;
+    }
+
+    if (!confirm(`Are you sure you want to delete "${playlist.name}"?`)) return;
+
+    const result = wasmCallWithError('ipod_delete_playlist', playlistIndex);
+    if (result !== 0) return;
+
+    log(`Deleted playlist: ${playlist.name}`, 'success');
+    
+    // If we were viewing the deleted playlist, switch to All Tracks
+    if (currentPlaylistIndex === playlistIndex) {
+        currentPlaylistIndex = -1;
+    }
+    
+    await loadPlaylists();
+    await refreshCurrentView();
+}
+
 // ============================================================================
 // Track Management
 // ============================================================================
 
 async function deleteTrack(trackId) {
-    if (!confirm('Are you sure you want to delete this track?')) {
-        return;
-    }
+    if (!confirm('Are you sure you want to delete this track?')) return;
 
-    const result = wasmCall('ipod_remove_track', trackId);
-
-    if (result !== 0) {
-        const errorPtr = wasmCall('ipod_get_last_error');
-        log(`Failed to delete track: ${wasmGetString(errorPtr)}`, 'error');
-        return;
-    }
+    const result = wasmCallWithError('ipod_remove_track', trackId);
+    if (result !== 0) return;
 
     log(`Deleted track ID: ${trackId}`, 'success');
     await loadTracks();
     await loadPlaylists();
+}
+
+/**
+ * Remove a track from the current playlist
+ * Only works when viewing a non-master playlist
+ * @param {number} trackId - The track ID to remove
+ */
+async function removeTrackFromPlaylist(trackId) {
+    if (currentPlaylistIndex < 0 || currentPlaylistIndex >= allPlaylists.length) {
+        log('No playlist selected', 'warning');
+        return;
+    }
+
+    const playlist = allPlaylists[currentPlaylistIndex];
+    if (playlist.is_master) {
+        log('Cannot remove tracks from master playlist', 'warning');
+        return;
+    }
+
+    if (!confirm(`Remove this track from "${playlist.name}"?`)) return;
+
+    const result = wasmCall('ipod_playlist_remove_track', currentPlaylistIndex, trackId);
+    if (result !== 0) {
+        const errorPtr = wasmCall('ipod_get_last_error');
+        log(`Failed to remove track: ${wasmGetString(errorPtr)}`, 'error');
+        return;
+    }
+
+    log(`Removed track from playlist: ${playlist.name}`, 'success');
+    await loadPlaylistTracks(currentPlaylistIndex);
+    await loadPlaylists();
+}
+
+/**
+ * Add a track to a specific playlist
+ * @param {number} trackId - The track ID to add
+ * @param {number} playlistIndex - The playlist index to add to
+ */
+async function addTrackToPlaylist(trackId, playlistIndex) {
+    if (playlistIndex < 0 || playlistIndex >= allPlaylists.length) {
+        log('Invalid playlist index', 'error');
+        return;
+    }
+
+    const playlist = allPlaylists[playlistIndex];
+    if (playlist.is_master) {
+        log('Cannot add tracks to master playlist directly', 'warning');
+        return;
+    }
+
+    const result = wasmCall('ipod_playlist_add_track', playlistIndex, trackId);
+    if (result === 0) {
+        log(`Added track to playlist: ${playlist.name}`, 'success');
+        await loadPlaylists(); // Refresh playlist counts
+    } else {
+        const errorPtr = wasmCall('ipod_get_last_error');
+        log(`Failed to add track: ${wasmGetString(errorPtr)}`, 'error');
+    }
+}
+
+// ============================================================================
+// Context Menu (Right-Click) Functionality
+// ============================================================================
+
+let contextMenuData = {
+    type: null,        // 'playlist' or 'track'
+    playlistIndex: null,
+    trackId: null
+};
+
+/**
+ * Show the context menu at the specified position
+ * @param {number} x - X coordinate
+ * @param {number} y - Y coordinate
+ */
+function showContextMenu(x, y) {
+    const menu = document.getElementById('contextMenu');
+    if (!menu) {
+        log('Context menu element not found when trying to show', 'error');
+        return;
+    }
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    menu.classList.add('show');
+}
+
+/**
+ * Hide the context menu
+ */
+function hideContextMenu() {
+    const menu = document.getElementById('contextMenu');
+    menu.classList.remove('show');
+    contextMenuData = { type: null, playlistIndex: null, trackId: null };
+}
+
+/**
+ * Attach context menu handlers to playlist items
+ * Right-click on a playlist shows "Delete Playlist" option
+ */
+function attachPlaylistContextMenus() {
+    // Use event delegation on the playlist list container
+    const playlistList = document.getElementById('playlistList');
+    if (!playlistList) return;
+    
+    // Remove old listener if exists
+    if (playlistList.dataset.contextMenuHandler) {
+        playlistList.removeEventListener('contextmenu', playlistList._contextMenuHandler);
+    }
+    
+    // Create new handler
+    playlistList._contextMenuHandler = (e) => {
+        // Find the closest playlist item
+        const item = e.target.closest('.playlist-item[data-playlist-index]');
+        if (!item) return;
+        
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const playlistIndex = parseInt(item.getAttribute('data-playlist-index'));
+        const playlist = allPlaylists[playlistIndex];
+        
+        // Don't show menu for master playlist
+        if (playlist && playlist.is_master) return;
+        
+        const deletePlaylistBtn = document.getElementById('contextDeletePlaylist');
+        const deleteTrackBtn = document.getElementById('contextDeleteTrack');
+        const addToPlaylistBtn = document.getElementById('contextAddToPlaylist');
+        const removeFromPlaylistBtn = document.getElementById('contextRemoveFromPlaylist');
+        
+        if (!deletePlaylistBtn || !deleteTrackBtn || !addToPlaylistBtn || !removeFromPlaylistBtn) {
+            log('Context menu elements not found', 'error');
+            return;
+        }
+        
+        contextMenuData = {
+            type: 'playlist',
+            playlistIndex: playlistIndex,
+            trackId: null
+        };
+        
+        // Show only delete playlist option
+        deletePlaylistBtn.style.display = 'block';
+        deleteTrackBtn.style.display = 'none';
+        addToPlaylistBtn.style.display = 'none';
+        removeFromPlaylistBtn.style.display = 'none';
+        
+        showContextMenu(e.pageX, e.pageY);
+    };
+    
+    playlistList.addEventListener('contextmenu', playlistList._contextMenuHandler);
+    playlistList.dataset.contextMenuHandler = 'true';
+}
+
+/**
+ * Attach context menu handlers to track rows
+ * Right-click on a track shows:
+ * - "Delete Track" (always)
+ * - "Add to Playlist" (with submenu of non-master playlists)
+ * - "Remove from Playlist" (only if viewing a non-master playlist)
+ */
+function attachTrackContextMenus() {
+    // Use event delegation on the track table body
+    const trackTable = document.getElementById('trackTableBody');
+    if (!trackTable) return;
+    
+    // Remove old listener if exists
+    if (trackTable.dataset.contextMenuHandler) {
+        trackTable.removeEventListener('contextmenu', trackTable._contextMenuHandler);
+    }
+    
+    // Create new handler
+    trackTable._contextMenuHandler = (e) => {
+        // Find the closest track row
+        const row = e.target.closest('tr[data-track-id]');
+        if (!row) return;
+        
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const trackId = parseInt(row.getAttribute('data-track-id'));
+        
+        const deletePlaylistBtn = document.getElementById('contextDeletePlaylist');
+        const deleteTrackBtn = document.getElementById('contextDeleteTrack');
+        const addToPlaylistBtn = document.getElementById('contextAddToPlaylist');
+        const removeFromPlaylistBtn = document.getElementById('contextRemoveFromPlaylist');
+        
+        if (!deletePlaylistBtn || !deleteTrackBtn || !addToPlaylistBtn || !removeFromPlaylistBtn) {
+            log('Context menu elements not found', 'error');
+            return;
+        }
+        
+        contextMenuData = {
+            type: 'track',
+            playlistIndex: currentPlaylistIndex,
+            trackId: trackId
+        };
+        
+        // Show delete track option
+        deleteTrackBtn.style.display = 'block';
+        
+        // Show add to playlist option with submenu
+        addToPlaylistBtn.style.display = 'block';
+        buildPlaylistSubmenu(trackId);
+        
+        // Show remove from playlist only if in a non-master playlist
+        const showRemove = currentPlaylistIndex >= 0 && 
+                          currentPlaylistIndex < allPlaylists.length &&
+                          !allPlaylists[currentPlaylistIndex].is_master;
+        removeFromPlaylistBtn.style.display = showRemove ? 'block' : 'none';
+        
+        // Hide delete playlist option
+        deletePlaylistBtn.style.display = 'none';
+        
+        showContextMenu(e.pageX, e.pageY);
+    };
+    
+    trackTable.addEventListener('contextmenu', trackTable._contextMenuHandler);
+    trackTable.dataset.contextMenuHandler = 'true';
+}
+
+/**
+ * Build the playlist submenu for "Add to Playlist"
+ * Shows all non-master playlists, excluding the current playlist if viewing one
+ * @param {number} trackId - The track ID to add
+ */
+function buildPlaylistSubmenu(trackId) {
+    const submenu = document.getElementById('playlistSubmenu');
+    
+    // Filter out master playlists and the current playlist (if viewing one)
+    const availablePlaylists = allPlaylists.filter((pl, index) => {
+        // Exclude master playlist
+        if (pl.is_master) return false;
+        
+        // Exclude current playlist if we're viewing one (not "All Tracks")
+        if (currentPlaylistIndex >= 0 && index === currentPlaylistIndex) return false;
+        
+        return true;
+    });
+    
+    if (availablePlaylists.length === 0) {
+        submenu.innerHTML = '<div class="context-submenu-item" style="opacity: 0.5;">No other playlists</div>';
+        return;
+    }
+    
+    submenu.innerHTML = availablePlaylists.map((pl) => {
+        const actualIndex = allPlaylists.indexOf(pl);
+        return `
+            <div class="context-submenu-item" onclick="addTrackToPlaylist(${trackId}, ${actualIndex}); hideContextMenu();">
+                ${escapeHtml(pl.name)}
+            </div>
+        `;
+    }).join('');
+}
+
+/**
+ * Initialize context menu event handlers
+ * Sets up click handlers for menu items and document click to close menu
+ */
+function initContextMenu() {
+    const menu = document.getElementById('contextMenu');
+    if (!menu) {
+        log('Context menu element not found', 'error');
+        return;
+    }
+    
+    const deletePlaylistBtn = document.getElementById('contextDeletePlaylist');
+    const deleteTrackBtn = document.getElementById('contextDeleteTrack');
+    const removeFromPlaylistBtn = document.getElementById('contextRemoveFromPlaylist');
+    
+    if (!deletePlaylistBtn || !deleteTrackBtn || !removeFromPlaylistBtn) {
+        log('Context menu buttons not found', 'error');
+        return;
+    }
+    
+    // Delete playlist handler
+    deletePlaylistBtn.addEventListener('click', () => {
+        if (contextMenuData.type === 'playlist' && contextMenuData.playlistIndex !== null) {
+            deletePlaylist(contextMenuData.playlistIndex);
+            hideContextMenu();
+        }
+    });
+    
+    // Delete track handler
+    deleteTrackBtn.addEventListener('click', () => {
+        if (contextMenuData.type === 'track' && contextMenuData.trackId !== null) {
+            deleteTrack(contextMenuData.trackId);
+            hideContextMenu();
+        }
+    });
+    
+    // Remove from playlist handler
+    removeFromPlaylistBtn.addEventListener('click', () => {
+        if (contextMenuData.type === 'track' && contextMenuData.trackId !== null) {
+            removeTrackFromPlaylist(contextMenuData.trackId);
+            hideContextMenu();
+        }
+    });
+    
+    // Close menu when clicking outside (only add once)
+    if (!window.contextMenuClickHandler) {
+        window.contextMenuClickHandler = (e) => {
+            if (!menu.contains(e.target)) {
+                hideContextMenu();
+            }
+        };
+        document.addEventListener('click', window.contextMenuClickHandler);
+    }
+    
+    // Close menu on escape key (only add once)
+    if (!window.contextMenuKeyHandler) {
+        window.contextMenuKeyHandler = (e) => {
+            if (e.key === 'Escape' && menu.classList.contains('show')) {
+                hideContextMenu();
+            }
+        };
+        document.addEventListener('keydown', window.contextMenuKeyHandler);
+    }
 }
 
 // ============================================================================
@@ -950,17 +1237,15 @@ function updateConnectionStatus(connected) {
     } else {
         dot.classList.remove('connected');
         text.textContent = 'Not Connected';
-        btn.textContent = '📁 Select iPod Folder';
+        btn.textContent = '📁 Select iPod';
     }
 }
 
 function enableUIIfReady() {
     const ready = wasmReady && isConnected;
-
-    document.getElementById('uploadBtn').disabled = !ready;
-    document.getElementById('saveBtn').disabled = !ready;
-    document.getElementById('refreshBtn').disabled = !ready;
-    document.getElementById('newPlaylistBtn').disabled = !ready;
+    ['uploadBtn', 'saveBtn', 'refreshBtn', 'newPlaylistBtn'].forEach(id => {
+        document.getElementById(id).disabled = !ready;
+    });
 }
 
 // ============================================================================
@@ -970,19 +1255,16 @@ function enableUIIfReady() {
 document.addEventListener('DOMContentLoaded', () => {
     log('TunesReloaded initialized');
 
-    // Check if File System Access API is available
     if (!('showDirectoryPicker' in window)) {
         log('File System Access API not supported. Use Chrome or Edge.', 'error');
         document.getElementById('connectBtn').disabled = true;
     }
 
-    // Initialize WASM module
     initWasm();
+    initContextMenu(); // Initialize context menu handlers
 });
 
-// Handle keyboard shortcuts
 document.addEventListener('keydown', (e) => {
-    // Ctrl/Cmd + S to save
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
         if (isConnected) saveDatabase();

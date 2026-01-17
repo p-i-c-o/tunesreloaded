@@ -1,0 +1,1129 @@
+/*
+ * ipod_manager.c - Track upload and playlist management for TunesReloaded
+ *
+ * WebAssembly bindings for libgpod functionality.
+ * Compiled with Emscripten to interface with Chrome File System Access API.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <time.h>
+#include <emscripten.h>
+#include "itdb.h"
+
+/* Global database pointer */
+static Itdb_iTunesDB *g_itdb = NULL;
+static char g_mountpoint[4096] = "";
+static char g_last_error[1024] = "";
+
+/* ============================================================================
+ * Utility Functions
+ * ============================================================================ */
+
+static void set_error(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(g_last_error, sizeof(g_last_error), fmt, args);
+    va_end(args);
+    printf("[ERROR] %s\n", g_last_error);
+}
+
+static void log_info(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buf[1024];
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    printf("[INFO] %s\n", buf);
+}
+
+/* Helper: Validate and sanitize UTF-8 string
+ * Returns a newly allocated string (caller must free) or NULL on error
+ * Invalid UTF-8 sequences are stripped
+ */
+static char* sanitize_utf8_string(const char *str) {
+    if (!str) return NULL;
+    
+    const gchar *end = NULL;
+    if (!g_utf8_validate(str, -1, &end)) {
+        if (end && end > str) {
+            gsize bytes_read = end - str;
+            gchar *safe = g_malloc(bytes_read + 1);
+            memcpy(safe, str, bytes_read);
+            safe[bytes_read] = '\0';
+            return safe;
+        }
+        return g_strdup("");
+    }
+    return g_strdup(str);
+}
+
+/* Helper: Sanitize a string field if invalid UTF-8
+ * Replaces the field pointer if sanitization is needed
+ */
+static void sanitize_field_if_needed(char **field_ptr, const char *field_name, guint32 track_id) {
+    if (!field_ptr || !*field_ptr) return;
+    
+    if (!g_utf8_validate(*field_ptr, -1, NULL)) {
+        log_info("Warning: Track %u has invalid UTF-8 in %s, sanitizing", track_id, field_name);
+        char *old = *field_ptr;
+        *field_ptr = sanitize_utf8_string(old);
+        g_free(old);
+    }
+}
+
+/* Helper: Escape JSON string into buffer
+ * Returns number of characters written (excluding null terminator)
+ */
+static int escape_json_string(char *dest, const char *src, size_t max_len) {
+    if (!src || !dest || max_len < 1) {
+        if (dest && max_len > 0) dest[0] = '\0';
+        return 0;
+    }
+    
+    char *dst = dest;
+    const char *s = src;
+    size_t remaining = max_len - 1;
+    
+    while (*s && remaining > 0) {
+        if (*s == '"' || *s == '\\') {
+            if (remaining < 2) break;
+            *dst++ = '\\';
+            *dst++ = *s++;
+            remaining -= 2;
+        } else if (*s == '\n') {
+            if (remaining < 2) break;
+            *dst++ = '\\';
+            *dst++ = 'n';
+            s++;
+            remaining -= 2;
+        } else if (*s == '\r') {
+            if (remaining < 2) break;
+            *dst++ = '\\';
+            *dst++ = 'r';
+            s++;
+            remaining -= 2;
+        } else {
+            *dst++ = *s++;
+            remaining--;
+        }
+    }
+    *dst = '\0';
+    return dst - dest;
+}
+
+/* ============================================================================
+ * Database Functions
+ * ============================================================================ */
+
+/**
+ * Get the last error message
+ */
+EMSCRIPTEN_KEEPALIVE
+const char* ipod_get_last_error(void) {
+    return g_last_error;
+}
+
+/**
+ * Clear the last error
+ */
+EMSCRIPTEN_KEEPALIVE
+void ipod_clear_error(void) {
+    g_last_error[0] = '\0';
+}
+
+/**
+ * Set the mountpoint path for the iPod
+ * Also sets it on the database if it exists
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_set_mountpoint(const char *mountpoint) {
+    if (!mountpoint || strlen(mountpoint) == 0) {
+        set_error("Mountpoint cannot be empty");
+        return -1;
+    }
+    strncpy(g_mountpoint, mountpoint, sizeof(g_mountpoint) - 1);
+    g_mountpoint[sizeof(g_mountpoint) - 1] = '\0';
+    
+    // Also set mountpoint on database if it exists
+    if (g_itdb) {
+        itdb_set_mountpoint(g_itdb, g_mountpoint);
+    }
+    
+    log_info("Mountpoint set to: %s", g_mountpoint);
+    return 0;
+}
+
+/**
+ * Get the current mountpoint
+ */
+EMSCRIPTEN_KEEPALIVE
+const char* ipod_get_mountpoint(void) {
+    return g_mountpoint;
+}
+
+/**
+ * Parse/load an existing iTunesDB from the iPod
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_parse_db(void) {
+    GError *error = NULL;
+
+    if (strlen(g_mountpoint) == 0) {
+        set_error("Mountpoint not set. Call ipod_set_mountpoint first.");
+        return -1;
+    }
+
+    /* Free existing database if any */
+    if (g_itdb) {
+        itdb_free(g_itdb);
+        g_itdb = NULL;
+    }
+
+    log_info("Parsing iTunesDB from: %s", g_mountpoint);
+    g_itdb = itdb_parse(g_mountpoint, &error);
+
+    if (!g_itdb) {
+        if (error) {
+            set_error("Failed to parse iTunesDB: %s", error->message);
+            g_error_free(error);
+        } else {
+            set_error("Failed to parse iTunesDB: Unknown error");
+        }
+        return -1;
+    }
+
+    // Set mountpoint on the database
+    itdb_set_mountpoint(g_itdb, g_mountpoint);
+    
+    // Read SysInfo to populate device information (model, generation, etc.)
+    if (g_itdb->device) {
+        if (itdb_device_read_sysinfo(g_itdb->device)) {
+            log_info("Successfully read SysInfo");
+        } else {
+            log_info("Warning: Could not read SysInfo (device info may be incomplete)");
+        }
+    }
+    
+    log_info("Successfully parsed iTunesDB. Tracks: %u, Playlists: %u",
+             itdb_tracks_number(g_itdb), itdb_playlists_number(g_itdb));
+    return 0;
+}
+
+/**
+ * Initialize a new iPod database
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_init_new(const char *model_number, const char *ipod_name) {
+    GError *error = NULL;
+
+    if (strlen(g_mountpoint) == 0) {
+        set_error("Mountpoint not set. Call ipod_set_mountpoint first.");
+        return -1;
+    }
+
+    if (!model_number) model_number = "MA450"; /* Default to iPod Classic 80GB */
+    if (!ipod_name) ipod_name = "iPod";
+
+    log_info("Initializing new iPod: model=%s, name=%s", model_number, ipod_name);
+
+    if (!itdb_init_ipod(g_mountpoint, model_number, ipod_name, &error)) {
+        if (error) {
+            set_error("Failed to initialize iPod: %s", error->message);
+            g_error_free(error);
+        } else {
+            set_error("Failed to initialize iPod: Unknown error");
+        }
+        return -1;
+    }
+
+    /* Now parse the newly created database */
+    return ipod_parse_db();
+}
+
+/**
+ * Write/save the iTunesDB back to the iPod
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_write_db(void) {
+    GError *error = NULL;
+
+    if (!g_itdb) {
+        set_error("No database loaded. Call ipod_parse_db first.");
+        return -1;
+    }
+
+    // Ensure mountpoint is set on the database before writing
+    // This is required for proper database structure validation
+    if (strlen(g_mountpoint) > 0) {
+        itdb_set_mountpoint(g_itdb, g_mountpoint);
+    }
+
+    // Validate database structure before writing
+    // Check that all tracks and playlists have valid UTF-8 strings
+    GList *tracks = g_itdb->tracks;
+    for (GList *l = tracks; l != NULL; l = l->next) {
+        Itdb_Track *track = (Itdb_Track *)l->data;
+        if (!track) continue;
+        
+        // Validate UTF-8 in ALL string fields that libgpod might validate
+        sanitize_field_if_needed(&track->title, "title", track->id);
+        sanitize_field_if_needed(&track->artist, "artist", track->id);
+        sanitize_field_if_needed(&track->album, "album", track->id);
+        sanitize_field_if_needed(&track->genre, "genre", track->id);
+        sanitize_field_if_needed(&track->filetype, "filetype", track->id);
+        sanitize_field_if_needed(&track->ipod_path, "ipod_path", track->id);
+    }
+    
+    // Validate playlist names and ensure all playlist members point to valid tracks
+    GList *playlists = g_itdb->playlists;
+    for (GList *l = playlists; l != NULL; l = l->next) {
+        Itdb_Playlist *pl = (Itdb_Playlist *)l->data;
+        if (!pl) continue;
+        
+        if (pl->name && !g_utf8_validate(pl->name, -1, NULL)) {
+            log_info("Warning: Playlist has invalid UTF-8 in name, sanitizing");
+            char *old_name = pl->name;
+            pl->name = sanitize_utf8_string(old_name);
+            g_free(old_name);
+        }
+        
+        // Validate that all playlist members point to tracks that exist in the database
+        // This prevents "link" assertion failures
+        GList *valid_tracks = g_itdb->tracks;
+        GList *members = pl->members;
+        GList *to_remove = NULL;
+        
+        // First pass: identify invalid members (collect track pointers, not list nodes)
+        for (GList *m = members; m != NULL; m = m->next) {
+            Itdb_Track *member_track = (Itdb_Track *)m->data;
+            if (!member_track) {
+                // NULL track pointer - collect the list node for removal
+                to_remove = g_list_prepend(to_remove, m);
+                log_info("Warning: Playlist %s has NULL track pointer", pl->name ? pl->name : "Unknown");
+                continue;
+            }
+            // Check if track exists in database by searching the tracks list
+            gboolean found = FALSE;
+            for (GList *t = valid_tracks; t != NULL; t = t->next) {
+                if (t->data == member_track) {
+                    found = TRUE;
+                    break;
+                }
+            }
+            if (!found) {
+                // Track not in database - collect the list node for removal
+                to_remove = g_list_prepend(to_remove, m);
+                log_info("Warning: Playlist %s references invalid track %u", 
+                         pl->name ? pl->name : "Unknown", member_track->id);
+            }
+        }
+        
+        // Second pass: remove invalid members directly from playlist members list
+        for (GList *rm = to_remove; rm != NULL; rm = rm->next) {
+            GList *member_node = (GList *)rm->data;
+            if (member_node) {
+                pl->members = g_list_remove_link(pl->members, member_node);
+                g_list_free_1(member_node);  // Free just this node, not the track
+            }
+        }
+        g_list_free(to_remove);
+    }
+
+    log_info("Writing iTunesDB...");
+
+    if (!itdb_write(g_itdb, &error)) {
+        if (error) {
+            set_error("Failed to write iTunesDB: %s", error->message);
+            g_error_free(error);
+        } else {
+            set_error("Failed to write iTunesDB: Unknown error");
+        }
+        return -1;
+    }
+
+    log_info("Successfully wrote iTunesDB");
+    return 0;
+}
+
+/**
+ * Close and free the database
+ */
+EMSCRIPTEN_KEEPALIVE
+void ipod_close_db(void) {
+    if (g_itdb) {
+        itdb_free(g_itdb);
+        g_itdb = NULL;
+        log_info("Database closed");
+    }
+}
+
+/**
+ * Check if database is loaded
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_is_db_loaded(void) {
+    return g_itdb != NULL ? 1 : 0;
+}
+
+/* ============================================================================
+ * Track Listing Functions
+ * ============================================================================ */
+
+/**
+ * Get total number of tracks
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_get_track_count(void) {
+    if (!g_itdb) return 0;
+    return (int)itdb_tracks_number(g_itdb);
+}
+
+/**
+ * Get track info as JSON string (caller must free)
+ * Returns NULL on error
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_get_track_json(int index) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return NULL;
+    }
+
+    GList *tracks = g_itdb->tracks;
+    Itdb_Track *track = (Itdb_Track *)g_list_nth_data(tracks, index);
+
+    if (!track) {
+        set_error("Track index %d out of range", index);
+        return NULL;
+    }
+
+    /* Build JSON string - escape special characters */
+    char *json = (char *)malloc(8192);
+    if (!json) return NULL;
+
+    char title_esc[512] = "", artist_esc[512] = "", album_esc[512] = "";
+    char genre_esc[256] = "", path_esc[1024] = "";
+
+    escape_json_string(title_esc, track->title, sizeof(title_esc));
+    escape_json_string(artist_esc, track->artist, sizeof(artist_esc));
+    escape_json_string(album_esc, track->album, sizeof(album_esc));
+    escape_json_string(genre_esc, track->genre, sizeof(genre_esc));
+    escape_json_string(path_esc, track->ipod_path, sizeof(path_esc));
+
+    snprintf(json, 8192,
+        "{"
+        "\"id\":%u,"
+        "\"dbid\":%llu,"
+        "\"title\":\"%s\","
+        "\"artist\":\"%s\","
+        "\"album\":\"%s\","
+        "\"genre\":\"%s\","
+        "\"track_nr\":%d,"
+        "\"cd_nr\":%d,"
+        "\"year\":%d,"
+        "\"tracklen\":%d,"
+        "\"bitrate\":%d,"
+        "\"samplerate\":%u,"
+        "\"size\":%d,"
+        "\"playcount\":%u,"
+        "\"rating\":%u,"
+        "\"ipod_path\":\"%s\","
+        "\"transferred\":%s"
+        "}",
+        track->id,
+        (unsigned long long)track->dbid,
+        title_esc,
+        artist_esc,
+        album_esc,
+        genre_esc,
+        track->track_nr,
+        track->cd_nr,
+        track->year,
+        track->tracklen,
+        track->bitrate,
+        track->samplerate,
+        track->size,
+        track->playcount,
+        track->rating,
+        path_esc,
+        track->transferred ? "true" : "false"
+    );
+
+    return json;
+}
+
+/**
+ * Get all tracks as JSON array (caller must free)
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_get_all_tracks_json(void) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return NULL;
+    }
+
+    int count = ipod_get_track_count();
+
+    /* Estimate size: ~1KB per track */
+    size_t buf_size = count * 1024 + 256;
+    char *json = (char *)malloc(buf_size);
+    if (!json) return NULL;
+
+    strcpy(json, "[");
+    size_t pos = 1;
+
+    for (int i = 0; i < count; i++) {
+        char *track_json = ipod_get_track_json(i);
+        if (track_json) {
+            size_t track_len = strlen(track_json);
+
+            /* Grow buffer if needed */
+            if (pos + track_len + 10 > buf_size) {
+                buf_size *= 2;
+                char *new_buf = realloc(json, buf_size);
+                if (!new_buf) {
+                    free(json);
+                    free(track_json);
+                    return NULL;
+                }
+                json = new_buf;
+            }
+
+            if (i > 0) json[pos++] = ',';
+            memcpy(json + pos, track_json, track_len);
+            pos += track_len;
+            free(track_json);
+        }
+    }
+
+    json[pos++] = ']';
+    json[pos] = '\0';
+
+    return json;
+}
+
+/**
+ * Free a string allocated by the library
+ */
+EMSCRIPTEN_KEEPALIVE
+void ipod_free_string(char *str) {
+    if (str) free(str);
+}
+
+/* ============================================================================
+ * Track Management Functions
+ * ============================================================================ */
+
+/**
+ * Create a new track and add it to the database
+ * Returns track ID on success, -1 on error
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_add_track(
+    const char *title,
+    const char *artist,
+    const char *album,
+    const char *genre,
+    int track_nr,
+    int cd_nr,
+    int year,
+    int tracklen_ms,
+    int bitrate,
+    int samplerate,
+    int size_bytes,
+    const char *filetype
+) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_new();
+    if (!track) {
+        set_error("Failed to create new track");
+        return -1;
+    }
+
+    /* Set metadata - validate UTF-8 to prevent assertion failures */
+    if (title) {
+        track->title = sanitize_utf8_string(title);
+    }
+    if (artist) {
+        track->artist = sanitize_utf8_string(artist);
+    }
+    if (album) {
+        track->album = sanitize_utf8_string(album);
+    }
+    if (genre) {
+        track->genre = sanitize_utf8_string(genre);
+    }
+    if (filetype) {
+        track->filetype = sanitize_utf8_string(filetype);
+    }
+
+    track->track_nr = track_nr;
+    track->cd_nr = cd_nr;
+    track->year = year;
+    track->tracklen = tracklen_ms;
+    track->bitrate = bitrate;
+    track->samplerate = samplerate;
+    track->size = size_bytes;
+
+    /* Set timestamps */
+    track->time_added = time(NULL);
+    track->time_modified = track->time_added;
+
+    /* Set media type to audio */
+    track->mediatype = ITDB_MEDIATYPE_AUDIO;
+
+    /* Mark as not yet transferred */
+    track->transferred = FALSE;
+
+    /* Add to database (at end) */
+    itdb_track_add(g_itdb, track, -1);
+
+    /* Also add to master playlist (if not already present) */
+    Itdb_Playlist *mpl = itdb_playlist_mpl(g_itdb);
+    if (mpl && !itdb_playlist_contains_track(mpl, track)) {
+        itdb_playlist_add_track(mpl, track, -1);
+    }
+
+    log_info("Added track: %s - %s (ID: %u)",
+             artist ? artist : "Unknown",
+             title ? title : "Unknown",
+             track->id);
+
+    return (int)track->id;
+}
+
+/**
+ * Finalize track after file is copied using libgpod's proper function
+ * This sets ipod_path, filetype_marker, transferred, and size
+ * @dest_filename: filesystem path (with slashes), not iPod path (with colons)
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_track_finalize(int track_id, const char *dest_filename) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_by_id(g_itdb, (guint32)track_id);
+    if (!track) {
+        set_error("Track not found: %d", track_id);
+        return -1;
+    }
+
+    GError *error = NULL;
+    
+    // Use libgpod's proper function to finalize the track
+    // This sets ipod_path (converts from FS to iPod format), filetype_marker, transferred, size
+    // Pass g_mountpoint (not NULL) so libgpod can properly resolve paths
+    Itdb_Track *finalized = itdb_cp_finalize(track, g_mountpoint, dest_filename, &error);
+    
+    if (!finalized) {
+        if (error) {
+            set_error("Failed to finalize track: %s", error->message);
+            g_error_free(error);
+        } else {
+            set_error("Failed to finalize track: Unknown error");
+        }
+        return -1;
+    }
+
+    log_info("Finalized track %d: %s", track_id, track->ipod_path ? track->ipod_path : "NULL");
+    return 0;
+}
+
+/**
+ * Set the iPod path for a track (legacy function - use ipod_track_finalize instead)
+ * Kept for backwards compatibility
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_track_set_path(int track_id, const char *ipod_path) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_by_id(g_itdb, (guint32)track_id);
+    if (!track) {
+        set_error("Track not found: %d", track_id);
+        return -1;
+    }
+
+    if (track->ipod_path) {
+        g_free(track->ipod_path);
+    }
+    track->ipod_path = g_strdup(ipod_path);
+    track->transferred = TRUE;
+
+    log_info("Set path for track %d: %s", track_id, ipod_path);
+    return 0;
+}
+
+/**
+ * Generate iPod destination path for a track using libgpod's proper function
+ * Returns allocated string (caller must free) - filesystem path format
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_get_track_dest_path(const char *original_filename) {
+    if (!g_itdb || strlen(g_mountpoint) == 0) {
+        set_error("No database or mountpoint");
+        return NULL;
+    }
+
+    GError *error = NULL;
+    
+    // Use libgpod's proper function to get destination filename
+    // This returns a filesystem path (with slashes), not iPod path (with colons)
+    gchar *dest_path = itdb_cp_get_dest_filename(NULL, g_mountpoint, original_filename, &error);
+    
+    if (!dest_path) {
+        if (error) {
+            set_error("Failed to get destination path: %s", error->message);
+            g_error_free(error);
+        } else {
+            set_error("Failed to get destination path: Unknown error");
+        }
+        return NULL;
+    }
+    
+    // Return as allocated string (caller must free)
+    return strdup(dest_path);
+}
+
+/**
+ * Remove a track from the database
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_remove_track(int track_id) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_by_id(g_itdb, (guint32)track_id);
+    if (!track) {
+        set_error("Track not found: %d", track_id);
+        return -1;
+    }
+
+    char *title = track->title ? g_strdup(track->title) : g_strdup("Unknown");
+
+    // CRITICAL: itdb_track_remove does NOT remove tracks from playlists!
+    // We must explicitly remove the track from all playlists first to prevent
+    // broken links that cause "prepare_itdb_for_write: assertion 'link' failed"
+    GList *playlists = g_itdb->playlists;
+    for (GList *l = playlists; l != NULL; l = l->next) {
+        Itdb_Playlist *pl = (Itdb_Playlist *)l->data;
+        if (pl && itdb_playlist_contains_track(pl, track)) {
+            itdb_playlist_remove_track(pl, track);
+            log_info("Removed track %d from playlist: %s", track_id, pl->name ? pl->name : "Unknown");
+        }
+    }
+
+    // Now remove the track from the database
+    // This frees the track memory, so we can't access track after this call
+    itdb_track_remove(track);
+
+    log_info("Removed track: %s (ID: %d)", title, track_id);
+    g_free(title);
+
+    return 0;
+}
+
+/**
+ * Update track metadata
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_update_track(
+    int track_id,
+    const char *title,
+    const char *artist,
+    const char *album,
+    const char *genre,
+    int track_nr,
+    int year,
+    int rating
+) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_by_id(g_itdb, (guint32)track_id);
+    if (!track) {
+        set_error("Track not found: %d", track_id);
+        return -1;
+    }
+
+    if (title) { g_free(track->title); track->title = sanitize_utf8_string(title); }
+    if (artist) { g_free(track->artist); track->artist = sanitize_utf8_string(artist); }
+    if (album) { g_free(track->album); track->album = sanitize_utf8_string(album); }
+    if (genre) { g_free(track->genre); track->genre = sanitize_utf8_string(genre); }
+    if (track_nr >= 0) track->track_nr = track_nr;
+    if (year >= 0) track->year = year;
+    if (rating >= 0) track->rating = rating;
+
+    track->time_modified = time(NULL);
+
+    log_info("Updated track: %d", track_id);
+    return 0;
+}
+
+/* ============================================================================
+ * Playlist Functions
+ * ============================================================================ */
+
+/**
+ * Get total number of playlists
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_get_playlist_count(void) {
+    if (!g_itdb) return 0;
+    return (int)itdb_playlists_number(g_itdb);
+}
+
+/**
+ * Get playlist info as JSON (caller must free)
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_get_playlist_json(int index) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return NULL;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_by_nr(g_itdb, (guint32)index);
+    if (!pl) {
+        set_error("Playlist index %d out of range", index);
+        return NULL;
+    }
+
+    char name_esc[512] = "";
+    escape_json_string(name_esc, pl->name, sizeof(name_esc));
+
+    char *json = (char *)malloc(2048);
+    if (!json) return NULL;
+
+    snprintf(json, 2048,
+        "{"
+        "\"id\":%llu,"
+        "\"name\":\"%s\","
+        "\"track_count\":%u,"
+        "\"is_master\":%s,"
+        "\"is_podcast\":%s,"
+        "\"is_smart\":%s"
+        "}",
+        (unsigned long long)pl->id,
+        name_esc,
+        itdb_playlist_tracks_number(pl),
+        itdb_playlist_is_mpl(pl) ? "true" : "false",
+        itdb_playlist_is_podcasts(pl) ? "true" : "false",
+        pl->is_spl ? "true" : "false"
+    );
+
+    return json;
+}
+
+/**
+ * Get all playlists as JSON array
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_get_all_playlists_json(void) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return NULL;
+    }
+
+    int count = ipod_get_playlist_count();
+    size_t buf_size = count * 512 + 256;
+    char *json = (char *)malloc(buf_size);
+    if (!json) return NULL;
+
+    strcpy(json, "[");
+    size_t pos = 1;
+
+    for (int i = 0; i < count; i++) {
+        char *pl_json = ipod_get_playlist_json(i);
+        if (pl_json) {
+            size_t pl_len = strlen(pl_json);
+            if (pos + pl_len + 10 > buf_size) {
+                buf_size *= 2;
+                char *new_buf = realloc(json, buf_size);
+                if (!new_buf) { free(json); free(pl_json); return NULL; }
+                json = new_buf;
+            }
+            if (i > 0) json[pos++] = ',';
+            memcpy(json + pos, pl_json, pl_len);
+            pos += pl_len;
+            free(pl_json);
+        }
+    }
+
+    json[pos++] = ']';
+    json[pos] = '\0';
+
+    return json;
+}
+
+/**
+ * Get tracks in a playlist as JSON array
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_get_playlist_tracks_json(int playlist_index) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return NULL;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_by_nr(g_itdb, (guint32)playlist_index);
+    if (!pl) {
+        set_error("Playlist index %d out of range", playlist_index);
+        return NULL;
+    }
+
+    int count = itdb_playlist_tracks_number(pl);
+    size_t buf_size = count * 1024 + 256;
+    char *json = (char *)malloc(buf_size);
+    if (!json) return NULL;
+
+    strcpy(json, "[");
+    size_t pos = 1;
+
+    GList *members = pl->members;
+    int idx = 0;
+    for (GList *l = members; l != NULL; l = l->next, idx++) {
+        Itdb_Track *track = (Itdb_Track *)l->data;
+        if (!track) continue;
+
+        /* Find track index in main list */
+        int track_idx = g_list_index(g_itdb->tracks, track);
+        if (track_idx < 0) continue;
+
+        char *track_json = ipod_get_track_json(track_idx);
+        if (track_json) {
+            size_t track_len = strlen(track_json);
+            if (pos + track_len + 10 > buf_size) {
+                buf_size *= 2;
+                char *new_buf = realloc(json, buf_size);
+                if (!new_buf) { free(json); free(track_json); return NULL; }
+                json = new_buf;
+            }
+            if (idx > 0) json[pos++] = ',';
+            memcpy(json + pos, track_json, track_len);
+            pos += track_len;
+            free(track_json);
+        }
+    }
+
+    json[pos++] = ']';
+    json[pos] = '\0';
+
+    return json;
+}
+
+/**
+ * Create a new playlist
+ * Returns playlist index on success, -1 on error
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_create_playlist(const char *name) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    if (!name || strlen(name) == 0) {
+        set_error("Playlist name cannot be empty");
+        return -1;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_new(name, FALSE);
+    if (!pl) {
+        set_error("Failed to create playlist");
+        return -1;
+    }
+
+    itdb_playlist_add(g_itdb, pl, -1);
+
+    /* Find the index */
+    int idx = -1;
+    GList *playlists = g_itdb->playlists;
+    int i = 0;
+    for (GList *l = playlists; l != NULL; l = l->next, i++) {
+        if (l->data == pl) {
+            idx = i;
+            break;
+        }
+    }
+
+    log_info("Created playlist: %s (index: %d)", name, idx);
+    return idx;
+}
+
+/**
+ * Delete a playlist
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_delete_playlist(int playlist_index) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_by_nr(g_itdb, (guint32)playlist_index);
+    if (!pl) {
+        set_error("Playlist index %d out of range", playlist_index);
+        return -1;
+    }
+
+    if (itdb_playlist_is_mpl(pl)) {
+        set_error("Cannot delete master playlist");
+        return -1;
+    }
+
+    char *name = pl->name ? g_strdup(pl->name) : g_strdup("Unknown");
+
+    itdb_playlist_remove(pl);
+
+    log_info("Deleted playlist: %s", name);
+    g_free(name);
+
+    return 0;
+}
+
+/**
+ * Rename a playlist
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_rename_playlist(int playlist_index, const char *new_name) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_by_nr(g_itdb, (guint32)playlist_index);
+    if (!pl) {
+        set_error("Playlist index %d out of range", playlist_index);
+        return -1;
+    }
+
+    if (!new_name || strlen(new_name) == 0) {
+        set_error("Playlist name cannot be empty");
+        return -1;
+    }
+
+    g_free(pl->name);
+    pl->name = g_strdup(new_name);
+
+    log_info("Renamed playlist %d to: %s", playlist_index, new_name);
+    return 0;
+}
+
+/**
+ * Add a track to a playlist
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_playlist_add_track(int playlist_index, int track_id) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_by_nr(g_itdb, (guint32)playlist_index);
+    if (!pl) {
+        set_error("Playlist index %d out of range", playlist_index);
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_by_id(g_itdb, (guint32)track_id);
+    if (!track) {
+        set_error("Track not found: %d", track_id);
+        return -1;
+    }
+
+    if (itdb_playlist_contains_track(pl, track)) {
+        log_info("Track %d already in playlist %d", track_id, playlist_index);
+        return 0; /* Not an error */
+    }
+
+    itdb_playlist_add_track(pl, track, -1);
+
+    log_info("Added track %d to playlist %d", track_id, playlist_index);
+    return 0;
+}
+
+/**
+ * Remove a track from a playlist
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_playlist_remove_track(int playlist_index, int track_id) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+
+    Itdb_Playlist *pl = itdb_playlist_by_nr(g_itdb, (guint32)playlist_index);
+    if (!pl) {
+        set_error("Playlist index %d out of range", playlist_index);
+        return -1;
+    }
+
+    Itdb_Track *track = itdb_track_by_id(g_itdb, (guint32)track_id);
+    if (!track) {
+        set_error("Track not found: %d", track_id);
+        return -1;
+    }
+
+    if (!itdb_playlist_contains_track(pl, track)) {
+        set_error("Track %d not in playlist %d", track_id, playlist_index);
+        return -1;
+    }
+
+    itdb_playlist_remove_track(pl, track);
+
+    log_info("Removed track %d from playlist %d", track_id, playlist_index);
+    return 0;
+}
+
+
+/* ============================================================================
+ * File Copy Helper (for manual file placement)
+ * ============================================================================ */
+
+/**
+ * Convert filesystem path to iPod path format
+ * (replaces / with :)
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_path_to_ipod_format(const char *fs_path) {
+    if (!fs_path) return NULL;
+
+    char *ipod_path = g_strdup(fs_path);
+    for (char *p = ipod_path; *p; p++) {
+        if (*p == '/') *p = ':';
+    }
+
+    return ipod_path;
+}
+
+/**
+ * Convert iPod path to filesystem path format
+ * (replaces : with /)
+ */
+EMSCRIPTEN_KEEPALIVE
+char* ipod_path_to_fs_format(const char *ipod_path) {
+    if (!ipod_path) return NULL;
+
+    char *fs_path = g_strdup(ipod_path);
+    for (char *p = fs_path; *p; p++) {
+        if (*p == ':') *p = '/';
+    }
+
+    return fs_path;
+}

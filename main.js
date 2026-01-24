@@ -2,6 +2,7 @@ import { createLogger } from './modules/logger.js';
 import { createWasmApi } from './modules/wasmApi.js';
 import { createFsSync } from './modules/fsSync.js';
 import { createContextMenu } from './modules/contextMenu.js';
+import { createFirewireSetup } from './modules/firewireSetup.js';
 import { readAudioTags, getAudioProperties, getFiletypeFromName, isAudioFile } from './modules/audio.js';
 import { renderTracks, renderPlaylists, formatDuration, updateConnectionStatus, enableUIIfReady } from './modules/uiRender.js';
 
@@ -19,6 +20,7 @@ let currentPlaylistIndex = -1; // -1 means "All Tracks"
 const { log, toggleLogPanel, escapeHtml } = createLogger();
 const wasm = createWasmApi({ log });
 const fsSync = createFsSync({ log, wasm, mountpoint: '/iPod' });
+const firewireSetup = createFirewireSetup({ log });
 
 // === Database / view refresh ===
 async function parseDatabase() {
@@ -112,8 +114,15 @@ async function selectIpodFolder() {
         const isValid = await fsSync.verifyIpodStructure(handle);
         if (!isValid) log('Warning: This folder may not be an iPod. Looking for iPod_Control folder...', 'warning');
 
-        await fsSync.setupWasmFilesystem(handle);
-        await parseDatabase();
+        // Check if FirewireGuid exists (needed for iPod Classic 6G+)
+        const hasFirewireGuid = await firewireSetup.checkFirewireGuid(handle);
+        if (!hasFirewireGuid) {
+            log('FirewireGuid not found - iPod Classic may need setup', 'warning');
+            firewireSetup.showModal();
+            return; // Wait for user to complete setup
+        }
+
+        await continueIpodConnection();
     } catch (e) {
         if (e.name === 'AbortError') {
             log('Folder selection cancelled', 'warning');
@@ -121,6 +130,34 @@ async function selectIpodFolder() {
             log(`Error selecting folder: ${e.message}`, 'error');
         }
     }
+}
+
+async function continueIpodConnection() {
+    if (!ipodHandle) return;
+    await fsSync.setupWasmFilesystem(ipodHandle);
+    await parseDatabase();
+}
+
+// === FirewireGuid Setup (for iPod Classic 6G+) ===
+async function setupFirewireGuid() {
+    try {
+        await firewireSetup.performSetup(ipodHandle);
+        firewireSetup.hideModal();
+        log('FirewireGuid setup complete!', 'success');
+        await continueIpodConnection();
+    } catch (e) {
+        if (e.name === 'NotFoundError') {
+            log('No device selected', 'warning');
+        } else {
+            log(`WebUSB error: ${e.message}`, 'error');
+        }
+    }
+}
+
+async function skipFirewireSetup() {
+    firewireSetup.hideModal();
+    log('Skipping FirewireGuid setup - songs may not appear on iPod', 'warning');
+    await continueIpodConnection();
 }
 
 // === Playlist modal ===
@@ -440,6 +477,8 @@ Object.assign(window, {
     addTrackToPlaylist,
     removeTrackFromPlaylist,
     hideContextMenu: contextMenu.hideContextMenu,
+    setupFirewireGuid,
+    skipFirewireSetup,
 });
 
 // === Initialization ===

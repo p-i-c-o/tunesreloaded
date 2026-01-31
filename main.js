@@ -167,16 +167,20 @@ async function skipFirewireSetup() {
 
 // === Welcome Overlay (first visit only) ===
 const WELCOME_SEEN_KEY = 'tunesreloaded_welcome_seen';
+let isBrowserSupported = true;
 
 function dismissWelcome() {
     modals.hideWelcome();
     localStorage.setItem(WELCOME_SEEN_KEY, 'true');
+    
+    // Show browser compatibility warning if not supported
+    if (!isBrowserSupported) {
+        modals.showBrowserCompat();
+    }
 }
 
-function showWelcomeIfFirstVisit() {
-    if (!localStorage.getItem(WELCOME_SEEN_KEY)) {
-        modals.showWelcome();
-    }
+function hideBrowserCompatModal() {
+    modals.hideBrowserCompat();
 }
 
 // === Playlist modal ===
@@ -505,19 +509,28 @@ Object.assign(window, {
     setupFirewireGuid,
     skipFirewireSetup,
     dismissWelcome,
+    hideBrowserCompatModal,
 });
 
 // === Initialization ===
 document.addEventListener('DOMContentLoaded', async () => {
     log('TunesReloaded initialized');
 
-    // Show welcome overlay on first visit
-    showWelcomeIfFirstVisit();
-
+    // Check browser compatibility first
     if (!('showDirectoryPicker' in window)) {
+        isBrowserSupported = false;
         log('File System Access API not supported. Use Chrome or Edge.', 'error');
         const btn = document.getElementById('connectBtn');
         if (btn) btn.disabled = true;
+    }
+
+    // Show welcome overlay on first visit, or show browser compat warning if unsupported
+    const isFirstVisit = !localStorage.getItem(WELCOME_SEEN_KEY);
+    if (isFirstVisit) {
+        modals.showWelcome();
+    } else if (!isBrowserSupported) {
+        // Returning user on unsupported browser - show compat modal directly
+        modals.showBrowserCompat();
     }
 
     initDragAndDrop();

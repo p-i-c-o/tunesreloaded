@@ -21,6 +21,7 @@ export function createModalManager() {
         newPlaylist: 'newPlaylistModal',
         firewireSetup: 'firewireSetupModal',
         welcome: 'welcomeOverlay',
+        browserCompat: 'browserCompatModal',
     };
 
     // Welcome overlay uses 'hidden' class instead of 'show'
@@ -45,5 +46,7 @@ export function createModalManager() {
         hideFirewireSetup: () => hide(modals.firewireSetup),
         showWelcome,
         hideWelcome,
+        showBrowserCompat: () => show(modals.browserCompat),
+        hideBrowserCompat: () => hide(modals.browserCompat),
     };
 }

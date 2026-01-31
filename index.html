@@ -538,9 +538,72 @@
         .context-submenu-item:hover {
             background: var(--bg-tertiary);
         }
+
+        /* Welcome Overlay */
+        .welcome-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(26, 26, 46, 0.85);
+            backdrop-filter: blur(3px);
+            -webkit-backdrop-filter: blur(3px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 3000;
+        }
+
+        .welcome-overlay.hidden {
+            display: none;
+        }
+
+        .welcome-card {
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 50px 80px;
+            max-width: 700px;
+            width: 90%;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+
+        .welcome-card h1 {
+            font-size: 2.2rem;
+            margin-bottom: 20px;
+            color: var(--text-primary);
+        }
+
+        .welcome-card p {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            margin-bottom: 30px;
+        }
+
+        .welcome-card .btn {
+            font-size: 1.1rem;
+            padding: 14px 32px;
+        }
     </style>
 </head>
 <body>
+    <!-- Welcome Overlay (first visit only) -->
+    <div class="welcome-overlay hidden" id="welcomeOverlay">
+        <div class="welcome-card">
+            <h1>TunesReloaded</h1>
+            <p>
+                TunesReloaded is a platform that allows you to sync music with your 
+                iPod Classic without needing to use iTunes. Connect your iPod to get started!
+            </p>
+            <button class="btn btn-primary" onclick="dismissWelcome()">
+                Get Started
+            </button>
+        </div>
+    </div>
+
     <div class="container">
         <header>
             <h1>TunesReloaded</h1>

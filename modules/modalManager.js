@@ -20,7 +20,17 @@ export function createModalManager() {
         upload: 'uploadModal',
         newPlaylist: 'newPlaylistModal',
         firewireSetup: 'firewireSetupModal',
+        welcome: 'welcomeOverlay',
     };
+
+    // Welcome overlay uses 'hidden' class instead of 'show'
+    function hideWelcome() {
+        document.getElementById(modals.welcome)?.classList.add('hidden');
+    }
+
+    function showWelcome() {
+        document.getElementById(modals.welcome)?.classList.remove('hidden');
+    }
 
     return {
         show,
@@ -33,5 +43,7 @@ export function createModalManager() {
         hideNewPlaylist: () => hide(modals.newPlaylist),
         showFirewireSetup: () => show(modals.firewireSetup),
         hideFirewireSetup: () => hide(modals.firewireSetup),
+        showWelcome,
+        hideWelcome,
     };
 }

@@ -165,6 +165,20 @@ async function skipFirewireSetup() {
     await continueIpodConnection();
 }
 
+// === Welcome Overlay (first visit only) ===
+const WELCOME_SEEN_KEY = 'tunesreloaded_welcome_seen';
+
+function dismissWelcome() {
+    modals.hideWelcome();
+    localStorage.setItem(WELCOME_SEEN_KEY, 'true');
+}
+
+function showWelcomeIfFirstVisit() {
+    if (!localStorage.getItem(WELCOME_SEEN_KEY)) {
+        modals.showWelcome();
+    }
+}
+
 // === Playlist modal ===
 function showNewPlaylistModal() {
     modals.showNewPlaylist();
@@ -490,11 +504,15 @@ Object.assign(window, {
     hideContextMenu: contextMenu.hideContextMenu,
     setupFirewireGuid,
     skipFirewireSetup,
+    dismissWelcome,
 });
 
 // === Initialization ===
 document.addEventListener('DOMContentLoaded', async () => {
     log('TunesReloaded initialized');
+
+    // Show welcome overlay on first visit
+    showWelcomeIfFirstVisit();
 
     if (!('showDirectoryPicker' in window)) {
         log('File System Access API not supported. Use Chrome or Edge.', 'error');

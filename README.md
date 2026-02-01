@@ -1,20 +1,20 @@
 # TunesReloaded
 
-[`TunesReloaded`](https://tunesreloaded.com) is a web-based classic iPod tool to add/manage songs directly, including .mp3's and .flacs. It runs entirely in the browser and uses the File System Access API to read and write directly to an iPod.
+[TunesReloaded](https://tunesreloaded.com) is a web-based classic iPod tool to add/manage songs directly, including .mp3's and .flacs. It runs entirely in the browser and uses the File System Access API to read and write directly to an iPod.
 
 ## Features
 
 - Manage tracks and playlists from the iPod’s database
 - Add/remove tracks via file picker or drag-and-drop, then sync in one batch 
 - Native .flac upload support!
-- Supports all legacy iPod classic's / non iPod touch models*
+- Supports all legacy iPod's (with 30-pin connector, non touch)*
 - Mac, Windows, Linux, ChromeOS are all supported!
 ## Quickstart
 ![TunesReloaded screenshot](assets/ipod_1.png)
 ![TunesReloaded screenshot](assets/ipod_2.png)
 
 
-1. Open [`TunesReloaded`](https://tunesreloaded.com) in a Chromium-based browser (Chrome / Edge).
+1. Open [TunesReloaded](https://tunesreloaded.com) in a Chromium-based browser (Chrome / Edge).
 2. Connect your iPod to your computer.
 3. Grant WebUSB permission so the app can identify your iPod model (required for correct database handling).
 4. Select the **root folder of the iPod drive** when prompted for file access.
@@ -40,7 +40,10 @@ For reduced memory usage, we stream music files directly to the iPod during sync
 - No album artwork support yet
 - Performance may be limited when uploading FLAC's due to high transcoding CPU usage. 
 
-If you find any other issues, please don't hesitate to open an issue request or send an email: info@tunesreloaded.com
+If you find any other issues, please don't hesitate to open an issue request or send an email, with logs: info@tunesreloaded.com
 ## Development
 
 Coming soon! 
+
+## Support
+If you found this tool helpful, please consider supporting development through [buying a coffee](https://https://buymeacoffee.com/riship1). I lose money on this endeavor through hosting + development costs, but I am passionate and committed to keep the new spirit of these old iPod's alive. All support is appreciated!

@@ -24,7 +24,7 @@ import { createTrackSelection } from './modules/trackSelection.js';
 const appState = createAppState();
 
 // Module instances
-const { log, toggleLogPanel, escapeHtml } = createLogger();
+const { log, escapeHtml } = createLogger();
 const wasm = createWasmApi({ log });
 const fsSync = createFsSync({ log, wasm, mountpoint: '/iPod' });
 const paths = createPaths({ wasm, mountpoint: '/iPod' });
@@ -454,7 +454,6 @@ const contextMenu = createContextMenu({
 
 // === Expose globals for inline HTML handlers ===
 Object.assign(window, {
-    toggleLogPanel,
     selectIpodFolder,
     uploadTracks,
     saveDatabase: syncPipeline.saveDatabase,
@@ -475,6 +474,9 @@ Object.assign(window, {
     hideIpodNotDetectedModal,
     removeQueuedTrack: uploadQueue.removeQueuedTrack,
     dismissUploadModal: syncPipeline.dismissUploadModal,
+    showBugReportModal,
+    hideBugReportModal,
+    confirmBugReport,
 });
 
 // === Initialization ===
@@ -530,4 +532,23 @@ document.addEventListener('keydown', (e) => {
         if (appState.isConnected) syncPipeline.saveDatabase();
     }
 });
+
+// === Footer actions ===
+function showBugReportModal() {
+    modals.show('bugReportModal');
+}
+
+function hideBugReportModal() {
+    modals.hide('bugReportModal');
+}
+
+function confirmBugReport() {
+    // Open GitHub issues in a new tab; user can paste logs/steps.
+    try {
+        window.open('https://github.com/rish1p/tunesreloaded/issues/new', '_blank', 'noopener,noreferrer');
+    } catch (_) {
+        // ignore
+    }
+    hideBugReportModal();
+}
 

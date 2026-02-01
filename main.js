@@ -12,7 +12,7 @@ import { createIpodConnectionMonitor } from './modules/ipodConnectionMonitor.js'
 import { createUploadQueue } from './modules/uploadQueue.js';
 import { createTrackOps } from './modules/trackOps.js';
 import { createSyncPipeline } from './modules/syncPipeline.js';
-import { transcodeFlacToAlacM4a } from './modules/transcode.js';
+import { createTranscodePool } from './modules/transcode.js';
 import { createTrackSelection } from './modules/trackSelection.js';
 
 /**
@@ -171,6 +171,8 @@ const uploadQueue = createUploadQueue({
     rerenderAllTracksIfVisible,
 });
 
+const transcodePool = createTranscodePool({ concurrency: 2 });
+
 const trackOps = createTrackOps({
     appState,
     wasm,
@@ -195,7 +197,7 @@ const syncPipeline = createSyncPipeline({
     rerenderAllTracksIfVisible,
     getOrComputeQueuedMeta: uploadQueue.getOrComputeQueuedMeta,
     readAudioMetadata,
-    transcodeFlacToAlacM4a,
+    transcodeFlacToAlacM4a: transcodePool.transcodeFlacToAlacM4a,
     getFiletypeFromName,
     formatDuration,
 });

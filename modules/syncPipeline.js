@@ -158,38 +158,38 @@ export function createSyncPipeline({
             log?.(`Staging ${toStage.length} queued track(s)...`, 'info');
             setUploadModalState({ status: `Uploading... (${toStage.length} track${toStage.length !== 1 ? 's' : ''})` });
 
-            for (let i = 0; i < toStage.length; i++) {
-                const item = toStage[i];
+            // Keep iPod writes sequential, but allow up to 2 FLAC transcodes to run concurrently
+            // in the background (via the transcode pool).
+            let completed = 0;
+            const total = toStage.length;
+
+            let uploadChain = Promise.resolve();
+            const enqueueUpload = (fn) => {
+                const next = uploadChain.then(fn, fn);
+                uploadChain = next.catch(() => {});
+                return next;
+            };
+
+            const flacTasks = [];
+
+            // Kick off FLAC transcodes early so they can overlap with MP3 uploads.
+            for (const item of toStage) {
                 const file = item.kind === 'handle' ? await item.handle.getFile() : item.file;
-                updateUploadProgress(i + 1, toStage.length, file?.name || item.name || 'Unknown');
-
-                const meta = await getOrComputeQueuedMeta(item, file);
                 const lowerName = String(file?.name || '').toLowerCase();
+                if (!lowerName.endsWith('.flac')) continue;
 
-                if (lowerName.endsWith('.flac')) {
+                const task = (async () => {
                     try {
                         setUploadModalState({
                             title: 'Uploading...',
-                            status: `Converting FLAC... ${i + 1} of ${toStage.length}`,
+                            status: 'Converting FLACs (up to 2 at a time)...',
                             detail: file.name,
-                            percent: Math.round(((i + 1) / toStage.length) * 100),
+                            percent: Math.round((completed / total) * 100),
                             showOk: false,
                         });
 
-                        const m4aFile = await transcodeFlacToAlacM4a(file, {
-                            onProgress: ({ progress }) => {
-                                const base = (i / toStage.length) * 100;
-                                const span = (1 / toStage.length) * 100;
-                                const p = Math.round(base + span * Math.max(0, Math.min(1, progress || 0)));
-                                setUploadModalState({
-                                    title: 'Uploading...',
-                                    status: `Converting FLAC... ${i + 1} of ${toStage.length}`,
-                                    detail: file.name,
-                                    percent: p,
-                                    showOk: false,
-                                });
-                            },
-                        });
+                        const meta = await getOrComputeQueuedMeta(item, file);
+                        const m4aFile = await transcodeFlacToAlacM4a(file);
 
                         const outMeta = await readAudioMetadata(m4aFile);
                         const combinedMeta = {
@@ -204,18 +204,39 @@ export function createSyncPipeline({
                             samplerateHz: outMeta.props.samplerate,
                         };
 
-                        const ok = await uploadSingleTrack(m4aFile, combinedMeta, { destName: m4aFile.name });
-                        if (ok) item.status = 'staged';
-                        continue;
+                        await enqueueUpload(async () => {
+                            updateUploadProgress(completed + 1, total, m4aFile.name);
+                            const ok = await uploadSingleTrack(m4aFile, combinedMeta, { destName: m4aFile.name });
+                            if (ok) item.status = 'staged';
+                            completed += 1;
+                            updateUploadProgress(completed, total, m4aFile.name);
+                        });
                     } catch (e) {
                         log?.(`FLAC convert failed: ${e?.message || e}`, 'error');
-                        continue;
                     }
-                }
+                })();
 
-                const ok = await uploadSingleTrack(file, meta);
-                if (ok) item.status = 'staged';
+                flacTasks.push(task);
             }
+
+            // Process non-FLAC uploads sequentially (while FLAC transcodes run in background).
+            for (const item of toStage) {
+                const file = item.kind === 'handle' ? await item.handle.getFile() : item.file;
+                const lowerName = String(file?.name || '').toLowerCase();
+                if (lowerName.endsWith('.flac')) continue; // handled by background tasks
+
+                const meta = await getOrComputeQueuedMeta(item, file);
+                await enqueueUpload(async () => {
+                    updateUploadProgress(completed + 1, total, file?.name || item.name || 'Unknown');
+                    const ok = await uploadSingleTrack(file, meta);
+                    if (ok) item.status = 'staged';
+                    completed += 1;
+                    updateUploadProgress(completed, total, file?.name || item.name || 'Unknown');
+                });
+            }
+
+            await Promise.allSettled(flacTasks);
+            await uploadChain;
 
             appState.pendingUploads = [...queue];
             rerenderAllTracksIfVisible?.();

@@ -8,32 +8,25 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
-let ffmpegSingleton = null;
-let ffmpegLoading = null;
-let lastLogHandler = null;
-let lastProgressHandler = null;
+async function loadFfmpegInstance(ffmpeg) {
+    // Vite note from ffmpeg.wasm docs: use the ESM build of @ffmpeg/core.
+    // We serve those files from /public/ffmpeg (same origin).
+    await ffmpeg.load({
+        // toBlobURL is used to bypass worker import restrictions.
+        coreURL: await toBlobURL('/ffmpeg/ffmpeg-core.js', 'text/javascript'),
+        wasmURL: await toBlobURL('/ffmpeg/ffmpeg-core.wasm', 'application/wasm'),
+        // Multithread core requires a dedicated worker script.
+        workerURL: await toBlobURL('/ffmpeg/ffmpeg-core.worker.js', 'text/javascript'),
+    });
+    return ffmpeg;
+}
 
-async function getFfmpeg() {
-    if (ffmpegSingleton?.loaded) return ffmpegSingleton;
-    if (ffmpegLoading) return ffmpegLoading;
-
-    const ffmpeg = new FFmpeg();
-
-    ffmpegLoading = (async () => {
-        // Vite note from ffmpeg.wasm docs: use the ESM build of @ffmpeg/core.
-        // We serve those files from /public/ffmpeg (same origin).
-        await ffmpeg.load({
-            // toBlobURL is used to bypass worker import restrictions.
-            coreURL: await toBlobURL('/ffmpeg/ffmpeg-core.js', 'text/javascript'),
-            wasmURL: await toBlobURL('/ffmpeg/ffmpeg-core.wasm', 'application/wasm'),
-            // Multithread core requires a dedicated worker script.
-            workerURL: await toBlobURL('/ffmpeg/ffmpeg-core.worker.js', 'text/javascript'),
-        });
-        ffmpegSingleton = ffmpeg;
-        return ffmpegSingleton;
-    })();
-
-    return ffmpegLoading;
+function computeThreadsPerJob(concurrency) {
+    const hc = Number(globalThis.navigator?.hardwareConcurrency || 0);
+    if (!Number.isFinite(hc) || hc <= 0) return 0; // let ffmpeg decide
+    // Leave 1 core for UI/event loop; split remaining cores across jobs.
+    const usable = Math.max(1, hc - 1);
+    return Math.max(1, Math.floor(usable / Math.max(1, concurrency)));
 }
 
 function replaceExtension(name, newExtWithDot) {
@@ -42,20 +35,18 @@ function replaceExtension(name, newExtWithDot) {
 }
 
 export async function transcodeFlacToAlacM4a(file, { onProgress, onLog } = {}) {
-    const ffmpeg = await getFfmpeg();
+    // Back-compat single-instance behavior:
+    // Create an isolated instance each call (safe but slower). Most callers should
+    // instead use createTranscodePool({ concurrency: 2 }).
+    const ffmpeg = await loadFfmpegInstance(new FFmpeg());
+    return await transcodeWithInstance(ffmpeg, file, { onProgress, onLog, threads: 0 });
+}
 
+async function transcodeWithInstance(ffmpeg, file, { onProgress, onLog, threads = 0 } = {}) {
     // Capture logs so failures are debuggable (rc=1 is otherwise opaque).
     const logLines = [];
 
-    // Replace previous handlers to avoid accumulating callbacks across runs.
-    try {
-        if (lastLogHandler) ffmpeg.off('log', lastLogHandler);
-        if (lastProgressHandler) ffmpeg.off('progress', lastProgressHandler);
-    } catch (_) {
-        // ignore
-    }
-
-    lastLogHandler = ({ type, message }) => {
+    const logHandler = ({ type, message }) => {
         if (typeof message === 'string' && message) {
             logLines.push(`[${type}] ${message}`);
             if (logLines.length > 200) logLines.shift();
@@ -64,17 +55,18 @@ export async function transcodeFlacToAlacM4a(file, { onProgress, onLog } = {}) {
             try { onLog({ type, message }); } catch (_) {}
         }
     };
-    ffmpeg.on('log', lastLogHandler);
-
-    lastProgressHandler = ({ progress, time }) => {
+    const progressHandler = ({ progress, time }) => {
         if (typeof onProgress === 'function') {
             try { onProgress({ progress, time }); } catch (_) {}
         }
     };
-    ffmpeg.on('progress', lastProgressHandler);
 
-    const inputName = 'input.flac';
-    const outputName = 'output.m4a';
+    ffmpeg.on('log', logHandler);
+    ffmpeg.on('progress', progressHandler);
+
+    const jobId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const inputName = `input-${jobId}.flac`;
+    const outputName = `output-${jobId}.m4a`;
 
     try {
         await ffmpeg.writeFile(inputName, await fetchFile(file));
@@ -89,7 +81,7 @@ export async function transcodeFlacToAlacM4a(file, { onProgress, onLog } = {}) {
         // -map 0:a:0 : pick first audio stream only
         // -vn/-sn/-dn: disable video/subtitle/data
         // -c:a alac   : encode ALAC
-        // -threads 0  : let ffmpeg auto-select thread count (works best with core-mt)
+        // -threads N  : cap per-job threads (avoid oversubscription when running 2 jobs)
         // -map_metadata 0 : preserve tags where possible
         const rc = await ffmpeg.exec([
             '-i', inputName,
@@ -97,7 +89,7 @@ export async function transcodeFlacToAlacM4a(file, { onProgress, onLog } = {}) {
             '-vn', '-sn', '-dn',
             '-map_metadata', '0',
             '-c:a', 'alac',
-            '-threads', '0',
+            '-threads', String(threads || 0),
             outputName
         ]);
         if (rc !== 0) {
@@ -112,6 +104,63 @@ export async function transcodeFlacToAlacM4a(file, { onProgress, onLog } = {}) {
         // Best-effort cleanup to reduce memory in the ffmpeg FS.
         try { await ffmpeg.deleteFile(inputName); } catch (_) {}
         try { await ffmpeg.deleteFile(outputName); } catch (_) {}
+        try { ffmpeg.off('log', logHandler); } catch (_) {}
+        try { ffmpeg.off('progress', progressHandler); } catch (_) {}
     }
+}
+
+export function createTranscodePool({ concurrency = 2 } = {}) {
+    const size = Math.max(1, Math.floor(concurrency));
+    const slots = Array.from({ length: size }, () => ({
+        ffmpeg: null,
+        loading: null,
+        busy: false,
+    }));
+
+    async function getSlot(i) {
+        const slot = slots[i];
+        if (slot.ffmpeg?.loaded) return slot;
+        if (slot.loading) {
+            await slot.loading;
+            return slot;
+        }
+        slot.ffmpeg = new FFmpeg();
+        slot.loading = (async () => {
+            await loadFfmpegInstance(slot.ffmpeg);
+            slot.loading = null;
+        })();
+        await slot.loading;
+        return slot;
+    }
+
+    async function acquire() {
+        // spin-wait with backoff; pool is tiny so this is fine
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            for (let i = 0; i < slots.length; i++) {
+                if (!slots[i].busy) {
+                    slots[i].busy = true;
+                    await getSlot(i);
+                    return { slot: slots[i], release: () => { slots[i].busy = false; } };
+                }
+            }
+            await new Promise((r) => setTimeout(r, 25));
+        }
+    }
+
+    async function transcodeFlacToAlacM4aPooled(file, { onProgress, onLog } = {}) {
+        const { slot, release } = await acquire();
+        const threads = computeThreadsPerJob(size);
+        try {
+            return await transcodeWithInstance(slot.ffmpeg, file, { onProgress, onLog, threads });
+        } finally {
+            release();
+        }
+    }
+
+    return {
+        transcodeFlacToAlacM4a: transcodeFlacToAlacM4aPooled,
+        concurrency: size,
+    };
 }
 

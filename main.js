@@ -24,7 +24,7 @@ import { createTrackSelection } from './modules/trackSelection.js';
 const appState = createAppState();
 
 // Module instances
-const { log, escapeHtml } = createLogger();
+const { log, escapeHtml, logEntries } = createLogger();
 const wasm = createWasmApi({ log });
 const fsSync = createFsSync({ log, wasm, mountpoint: '/iPod' });
 const paths = createPaths({ wasm, mountpoint: '/iPod' });
@@ -477,6 +477,8 @@ Object.assign(window, {
     showBugReportModal,
     hideBugReportModal,
     confirmBugReport,
+    showConsoleModal,
+    hideConsoleModal,
 });
 
 // === Initialization ===
@@ -550,5 +552,25 @@ function confirmBugReport() {
         // ignore
     }
     hideBugReportModal();
+}
+
+function showConsoleModal() {
+    const el = document.getElementById('consoleLogContent');
+    if (el) {
+        const entries = Array.isArray(logEntries) ? logEntries.slice(-500) : [];
+        el.innerHTML = entries.map((e) => {
+            const type = escapeHtml(e.type || 'info');
+            const ts = escapeHtml(e.timestamp || '');
+            const msg = escapeHtml(e.message || '');
+            return `<div class="console-line ${type}"><span class="console-ts">[${ts}]</span>${msg}</div>`;
+        }).join('') || `<div class="console-line info">No logs yet.</div>`;
+        // Scroll to bottom
+        el.scrollTop = el.scrollHeight;
+    }
+    modals.show('consoleModal');
+}
+
+function hideConsoleModal() {
+    modals.hide('consoleModal');
 }
 

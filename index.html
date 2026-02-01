@@ -487,6 +487,39 @@
             background: rgba(255, 255, 255, 0.28);
         }
 
+        .bottom-banner-right {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* Console modal log */
+        .console-log {
+            max-height: 320px;
+            overflow: auto;
+            padding: 10px 12px;
+            border: 1px solid var(--glass-border);
+            border-radius: 10px;
+            background: rgba(15, 15, 20, 0.85);
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+
+        .console-line {
+            padding: 3px 0;
+            border-bottom: 1px solid var(--glass-border);
+            color: var(--text-mid);
+        }
+        .console-line.success { color: var(--success); }
+        .console-line.warning { color: var(--warning); }
+        .console-line.error { color: var(--error); }
+
+        .console-ts {
+            color: var(--itunes-gray);
+            margin-right: 10px;
+        }
+
         /* Modal overlay */
         .modal-overlay {
             position: fixed;
@@ -823,7 +856,10 @@
     <!-- Footer Banner -->
     <div class="bottom-banner" id="bottomBanner">
         <a href="/about.html">About</a>
-        <button type="button" onclick="showBugReportModal()">Report Bug</button>
+        <div class="bottom-banner-right">
+            <button type="button" onclick="showBugReportModal()">Report Bug</button>
+            <button type="button" onclick="showConsoleModal()">Console</button>
+        </div>
     </div>
 
     <!-- New Playlist Modal -->
@@ -883,6 +919,17 @@
             <div class="modal-actions" style="justify-content: center;">
                 <button class="btn btn-secondary" onclick="hideBugReportModal()">No</button>
                 <button class="btn btn-primary" onclick="confirmBugReport()">Yes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Console Modal -->
+    <div class="modal-overlay" id="consoleModal">
+        <div class="modal" style="max-width: 760px;">
+            <h2>Console</h2>
+            <div class="console-log" id="consoleLogContent"></div>
+            <div class="modal-actions" style="justify-content: center;">
+                <button class="btn btn-primary" onclick="hideConsoleModal()">Close</button>
             </div>
         </div>
     </div>

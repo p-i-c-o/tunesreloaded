@@ -46,4 +46,4 @@ If you find any other issues, please don't hesitate to open an issue request or 
 Coming soon! 
 
 ## Support
-If you found this tool helpful, please consider supporting development through [buying a coffee](https://https://buymeacoffee.com/riship1). I lose money on this endeavor through hosting + development costs, but I am passionate and committed to keep the new spirit of these old iPod's alive. All support is appreciated!
+If you found this tool helpful, please consider supporting development through [buying a coffee](https://buymeacoffee.com/riship1). I lose money on this endeavor through hosting + development costs, but I am passionate and committed to keep the new spirit of these old iPod's alive. All support is appreciated!

@@ -31,16 +31,50 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
                 return false;
             }
 
-            try {
-                await itunesDir.getFileHandle('iTunesDB', { create: false });
-            } catch (e) {
-                const names = await listDirNames(itunesDir);
-                log(`Missing iPod_Control/iTunes/iTunesDB. Found in iTunes: ${names.join(', ') || '(empty)'}`, 'error');
-                return false;
+            // Classic layout: iTunesDB present.
+            const hasClassicDb = await (async () => {
+                try {
+                    await itunesDir.getFileHandle('iTunesDB', { create: false });
+                    return true;
+                } catch {
+                    return false;
+                }
+            })();
+
+            if (hasClassicDb) {
+                log('Found iPod_Control/iTunes/iTunesDB', 'success');
+                return true;
             }
 
-            log('Found iPod_Control/iTunes/iTunesDB', 'success');
-            return true;
+            // Nano5G / modern layout: iTunesCDB + iTunes Library.itlp (sqlite bundle) present.
+            const hasModernLayout = await (async () => {
+                try {
+                    await itunesDir.getFileHandle('iTunesCDB', { create: false });
+                } catch {
+                    return false;
+                }
+                try {
+                    // On newer devices the sqlite DBs live in "iTunes Library.itlp"
+                    await itunesDir.getDirectoryHandle('iTunes Library.itlp', { create: false });
+                } catch {
+                    try {
+                        // Older docs mention "iTunes Library" without the .itlp suffix
+                        await itunesDir.getDirectoryHandle('iTunes Library', { create: false });
+                    } catch {
+                        return false;
+                    }
+                }
+                return true;
+            })();
+
+            if (hasModernLayout) {
+                log('Found iTunesCDB and iTunesControl (sqlite layout) - treating as valid iPod database', 'info');
+                return true;
+            }
+
+            const names = await listDirNames(itunesDir);
+            log(`Missing classic iTunesDB and modern iTunesCDB/iTunesControl. Found in iTunes: ${names.join(', ') || '(empty)'}`, 'error');
+            return false;
         } catch (e) {
             const names = await listDirNames(handle);
             log(`Missing iPod_Control in selected folder. Found: ${names.join(', ') || '(empty)'}`, 'error');
@@ -86,12 +120,83 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
         const iPodControlHandle = await handle.getDirectoryHandle('iPod_Control', { create: false });
         const iTunesHandle = await iPodControlHandle.getDirectoryHandle('iTunes', { create: false });
 
-        // Copy iTunesDB
-        const dbFileHandle = await iTunesHandle.getFileHandle('iTunesDB', { create: false });
-        const dbFile = await dbFileHandle.getFile();
-        const dbData = new Uint8Array(await dbFile.arrayBuffer());
-        FS.writeFile(`${mountpoint}/iPod_Control/iTunes/iTunesDB`, dbData);
-        log(`Synced: iTunesDB (${dbData.length} bytes)`, 'info');
+        // Copy classic iTunesDB if present
+        try {
+            const dbFileHandle = await iTunesHandle.getFileHandle('iTunesDB', { create: false });
+            const dbFile = await dbFileHandle.getFile();
+            const dbData = new Uint8Array(await dbFile.arrayBuffer());
+            FS.writeFile(`${mountpoint}/iPod_Control/iTunes/iTunesDB`, dbData);
+            log(`Synced: iTunesDB (${dbData.length} bytes)`, 'info');
+        } catch (e) {
+            const names = await listDirNames(iTunesHandle);
+            log(`iTunesDB not found (this is expected on newer models). Found in iTunes: ${names.join(', ') || '(empty)'}`, 'info');
+        }
+
+        // Copy compressed iTunesCDB if present (Nano5G / iOS-style layout)
+        try {
+            const cdbHandle = await iTunesHandle.getFileHandle('iTunesCDB', { create: false });
+            const cdbFile = await cdbHandle.getFile();
+            const cdbData = new Uint8Array(await cdbFile.arrayBuffer());
+            FS.writeFile(`${mountpoint}/iPod_Control/iTunes/iTunesCDB`, cdbData);
+            log(`Synced: iTunesCDB (${cdbData.length} bytes)`, 'info');
+        } catch (_) {
+            // fine on classic models
+        }
+
+        // Copy sqlite tree (iTunes Library.itlp / iTunesControl) if present.
+        async function copyDirToVfs(realDirHandle, vfsDirPath) {
+            const FS = getFS();
+            if (!FS) throw new Error('WASM FS not ready');
+
+            // Ensure directory exists in VFS
+            try { FS.mkdir(vfsDirPath); } catch (_) {}
+
+            for await (const [name, entry] of realDirHandle.entries()) {
+                const childPath = `${vfsDirPath}/${name}`;
+                if (entry.kind === 'file') {
+                    try {
+                        const file = await entry.getFile();
+                        const data = new Uint8Array(await file.arrayBuffer());
+                        FS.writeFile(childPath, data);
+                    } catch (_) {
+                        // best-effort
+                    }
+                } else if (entry.kind === 'directory') {
+                    const subDir = await realDirHandle.getDirectoryHandle(name, { create: false });
+                    await copyDirToVfs(subDir, childPath);
+                }
+            }
+        }
+
+        // Prefer the documented "iTunes Library.itlp" bundle used by Nano5G / iOS-style devices.
+        (async () => {
+            try {
+                const itlpDir = await iTunesHandle.getDirectoryHandle('iTunes Library.itlp', { create: false });
+                await copyDirToVfs(itlpDir, `${mountpoint}/iPod_Control/iTunes/iTunes Library.itlp`);
+                log('Synced: iTunes Library.itlp (sqlite databases)', 'info');
+                return;
+            } catch (_) {
+                // fall through
+            }
+
+            try {
+                const itunesLibDir = await iTunesHandle.getDirectoryHandle('iTunes Library', { create: false });
+                await copyDirToVfs(itunesLibDir, `${mountpoint}/iPod_Control/iTunes/iTunes Library`);
+                log('Synced: iTunes Library (sqlite databases)', 'info');
+                return;
+            } catch (_) {
+                // fall through
+            }
+
+            // As a last resort, try iTunesControl (older docs / some devices).
+            try {
+                const ctrlDir = await iTunesHandle.getDirectoryHandle('iTunesControl', { create: false });
+                await copyDirToVfs(ctrlDir, `${mountpoint}/iPod_Control/iTunes/iTunesControl`);
+                log('Synced: iTunesControl (sqlite databases)', 'info');
+            } catch (_) {
+                // fine on classic models
+            }
+        })();
 
         // Copy SysInfo and SysInfoExtended (optional)
         try {

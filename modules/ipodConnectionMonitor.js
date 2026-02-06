@@ -59,7 +59,12 @@ export function createIpodConnectionMonitor({
                 // Lightweight probe: does the expected iPod structure still exist?
                 const control = await appState.ipodHandle.getDirectoryHandle('iPod_Control', { create: false });
                 const itunes = await control.getDirectoryHandle('iTunes', { create: false });
-                await itunes.getFileHandle('iTunesDB', { create: false });
+                // Classic devices have iTunesDB; newer ones (Nano5G, etc.) have iTunesCDB instead.
+                try {
+                    await itunes.getFileHandle('iTunesDB', { create: false });
+                } catch {
+                    await itunes.getFileHandle('iTunesCDB', { create: false });
+                }
             } catch (e) {
                 await disconnect(e?.name || e?.message || 'Disconnected');
             } finally {

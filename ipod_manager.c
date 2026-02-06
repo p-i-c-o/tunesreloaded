@@ -1077,6 +1077,47 @@ int ipod_update_track(
     return 0;
 }
 
+/**
+ * Returns 1 if the current device supports artwork (cover images), 0 otherwise.
+ * Call after ipod_parse_db() so that device info is available.
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_device_supports_artwork(void) {
+    if (!g_itdb || !g_itdb->device)
+        return 0;
+    return itdb_device_supports_artwork(g_itdb->device) ? 1 : 0;
+}
+
+/**
+ * Set a track's artwork (cover image) from raw image data.
+ * @param track_index: index of track in the tracks list (same as other track APIs).
+ * @param image_data: pointer to raw image bytes (e.g. JPEG/PNG file contents).
+ * @param image_data_len: length of image_data in bytes.
+ * @return 0 on success, -1 on error (check ipod_get_last_error()).
+ */
+EMSCRIPTEN_KEEPALIVE
+int ipod_track_set_artwork_from_data(int track_index, const unsigned char *image_data, unsigned int image_data_len) {
+    if (!g_itdb) {
+        set_error("No database loaded");
+        return -1;
+    }
+    if (!image_data && image_data_len > 0) {
+        set_error("Null image data");
+        return -1;
+    }
+    Itdb_Track *track = (Itdb_Track *)g_list_nth_data(g_itdb->tracks, (guint)track_index);
+    if (!track) {
+        set_error("Track not found at index: %d", track_index);
+        return -1;
+    }
+    if (!itdb_track_set_thumbnails_from_data(track, image_data, (gsize)image_data_len)) {
+        set_error("Failed to set artwork for track index %d", track_index);
+        return -1;
+    }
+    log_info("Set artwork for track index %d (%u bytes)", track_index, image_data_len);
+    return 0;
+}
+
 /* ============================================================================
  * Playlist Functions
  * ============================================================================ */

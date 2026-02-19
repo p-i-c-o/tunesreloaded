@@ -55,46 +55,48 @@ export function createFirewireSetup({ log }) {
         0x1303: { name: 'iPod Shuffle 4th Gen', modelNumStr: 'MC749', encrypted: false },
     };
 
-    // Model number prefix -> template file for devices that need a SysInfoExtended template.
-    // Each prefix (first 5 chars of order number) maps to the plist template to use.
+    // Model number (first letter stripped) -> template file for devices that need
+    // a SysInfoExtended template.  The first letter is dropped so both retail (M)
+    // and refurbished (L) units match the same entry, mirroring how libgpod stores
+    // model codes in itdb_device.c.
     const SYSINFO_EXTENDED_TEMPLATES = new Map([
         // Nano 5th Gen – 8 GB
-        ['MC031', '5_Nano_SysInfoExtended.plist'],
-        ['MC027', '5_Nano_SysInfoExtended.plist'],
-        ['MC037', '5_Nano_SysInfoExtended.plist'],
-        ['MC040', '5_Nano_SysInfoExtended.plist'],
-        ['MC046', '5_Nano_SysInfoExtended.plist'],
-        ['MC050', '5_Nano_SysInfoExtended.plist'],
-        ['MC034', '5_Nano_SysInfoExtended.plist'],
-        ['MC043', '5_Nano_SysInfoExtended.plist'],
-        ['MC049', '5_Nano_SysInfoExtended.plist'],
+        ['C031', '5_Nano_SysInfoExtended.plist'],
+        ['C027', '5_Nano_SysInfoExtended.plist'],
+        ['C037', '5_Nano_SysInfoExtended.plist'],
+        ['C040', '5_Nano_SysInfoExtended.plist'],
+        ['C046', '5_Nano_SysInfoExtended.plist'],
+        ['C050', '5_Nano_SysInfoExtended.plist'],
+        ['C034', '5_Nano_SysInfoExtended.plist'],
+        ['C043', '5_Nano_SysInfoExtended.plist'],
+        ['C049', '5_Nano_SysInfoExtended.plist'],
         // Nano 5th Gen – 16 GB
-        ['MC062', '5_Nano_SysInfoExtended.plist'],
-        ['MC060', '5_Nano_SysInfoExtended.plist'],
-        ['MC066', '5_Nano_SysInfoExtended.plist'],
-        ['MC068', '5_Nano_SysInfoExtended.plist'],
-        ['MC072', '5_Nano_SysInfoExtended.plist'],
-        ['MC075', '5_Nano_SysInfoExtended.plist'],
-        ['MC064', '5_Nano_SysInfoExtended.plist'],
-        ['MC070', '5_Nano_SysInfoExtended.plist'],
-        ['MC074', '5_Nano_SysInfoExtended.plist'],
+        ['C062', '5_Nano_SysInfoExtended.plist'],
+        ['C060', '5_Nano_SysInfoExtended.plist'],
+        ['C066', '5_Nano_SysInfoExtended.plist'],
+        ['C068', '5_Nano_SysInfoExtended.plist'],
+        ['C072', '5_Nano_SysInfoExtended.plist'],
+        ['C075', '5_Nano_SysInfoExtended.plist'],
+        ['C064', '5_Nano_SysInfoExtended.plist'],
+        ['C070', '5_Nano_SysInfoExtended.plist'],
+        ['C074', '5_Nano_SysInfoExtended.plist'],
         // Nano 7th Gen (2012)
-        ['MD475', '7_nano_SysInfoExtended.plist'],  // Pink
-        ['MD476', '7_nano_SysInfoExtended.plist'],  // Yellow
-        ['MD477', '7_nano_SysInfoExtended.plist'],  // Blue
-        ['MD478', '7_nano_SysInfoExtended.plist'],  // Green
-        ['MD479', '7_nano_SysInfoExtended.plist'],  // Purple
-        ['MD480', '7_nano_SysInfoExtended.plist'],  // Silver
-        ['MD481', '7_nano_SysInfoExtended.plist'],  // Slate
-        ['MD744', '7_nano_SysInfoExtended.plist'],  // (PRODUCT) RED
-        ['ME971', '7_nano_SysInfoExtended.plist'],  // Space Gray (2013 Slate replacement)
+        ['D475', '7_nano_SysInfoExtended.plist'],  // Pink
+        ['D476', '7_nano_SysInfoExtended.plist'],  // Yellow
+        ['D477', '7_nano_SysInfoExtended.plist'],  // Blue
+        ['D478', '7_nano_SysInfoExtended.plist'],  // Green
+        ['D479', '7_nano_SysInfoExtended.plist'],  // Purple
+        ['D480', '7_nano_SysInfoExtended.plist'],  // Silver
+        ['D481', '7_nano_SysInfoExtended.plist'],  // Slate
+        ['D744', '7_nano_SysInfoExtended.plist'],  // (PRODUCT) RED
+        ['E971', '7_nano_SysInfoExtended.plist'],  // Space Gray (2013 Slate replacement)
         // Nano 7th Gen (2015 refresh)
-        ['MKN02', '7_nano_SysInfoExtended.plist'],  // Blue
-        ['MKN22', '7_nano_SysInfoExtended.plist'],  // Silver
-        ['MKN52', '7_nano_SysInfoExtended.plist'],  // Space Gray
-        ['MKN72', '7_nano_SysInfoExtended.plist'],  // (PRODUCT) RED
-        ['MKMV2', '7_nano_SysInfoExtended.plist'],  // Hot Pink
-        ['MKMX2', '7_nano_SysInfoExtended.plist'],  // Gold
+        ['KN02', '7_nano_SysInfoExtended.plist'],  // Blue
+        ['KN22', '7_nano_SysInfoExtended.plist'],  // Silver
+        ['KN52', '7_nano_SysInfoExtended.plist'],  // Space Gray
+        ['KN72', '7_nano_SysInfoExtended.plist'],  // (PRODUCT) RED
+        ['KMV2', '7_nano_SysInfoExtended.plist'],  // Hot Pink
+        ['KMX2', '7_nano_SysInfoExtended.plist'],  // Gold
     ]);
 
     // Store device info from WebUSB for later use
@@ -106,12 +108,12 @@ export function createFirewireSetup({ log }) {
 
     const HASHAB_MODEL_PREFIXES = new Set([
         // Nano 6th gen (representative)
-        'MC525',
+        'C525',
         // Nano 7th gen (2012)
-        'MD475', 'MD476', 'MD477', 'MD478', 'MD479', 'MD480', 'MD481',
-        'MD744', 'ME971',
+        'D475', 'D476', 'D477', 'D478', 'D479', 'D480', 'D481',
+        'D744', 'E971',
         // Nano 7th gen (2015 refresh)
-        'MKN02', 'MKN22', 'MKN52', 'MKN72', 'MKMV2', 'MKMX2',
+        'KN02', 'KN22', 'KN52', 'KN72', 'KMV2', 'KMX2',
     ]);
 
     /**
@@ -142,7 +144,7 @@ export function createFirewireSetup({ log }) {
      */
     function getTemplateForModel(modelNumStr) {
         if (!modelNumStr) return null;
-        const code = String(modelNumStr).trim().slice(0, 5).toUpperCase();
+        const code = String(modelNumStr).trim().slice(1, 5).toUpperCase();
         return SYSINFO_EXTENDED_TEMPLATES.get(code) ?? null;
     }
 
@@ -425,8 +427,8 @@ export function createFirewireSetup({ log }) {
         getDetectedDevice: () => detectedDevice,
         getFirewireGuidHex: () => firewireGuidHex,
         needsHashAB: () => {
-            const prefix = (cachedModelNumStr || '').slice(0, 5).toUpperCase();
-            return HASHAB_MODEL_PREFIXES.has(prefix);
+            const code = (cachedModelNumStr || '').slice(1, 5).toUpperCase();
+            return HASHAB_MODEL_PREFIXES.has(code);
         },
     };
 }

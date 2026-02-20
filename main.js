@@ -238,7 +238,9 @@ async function selectIpodFolder() {
 
 async function continueIpodConnection() {
     if (!appState.ipodHandle) return;
-    await fsSync.setupWasmFilesystem(appState.ipodHandle);
+    await fsSync.setupWasmFilesystem(appState.ipodHandle, {
+        needsSysInfoExtended: firewireSetup.needsSysInfoExtended?.(),
+    });
     await parseDatabase();
 }
 

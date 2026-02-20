@@ -105,7 +105,7 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
         }
     }
 
-    async function setupWasmFilesystem(handle) {
+    async function setupWasmFilesystem(handle, options = {}) {
         log('Setting up virtual filesystem for WASM...');
         const FS = getFS();
         if (!FS) throw new Error('WASM FS not ready');
@@ -133,7 +133,8 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
 
         await syncIpodToVirtualFS(handle);
 
-        // SysInfoExtended must be visible so libgpod can set device->sysinfo_extended and run post-process commands (e.g. CreateIsHomeVideo).
+        // SysInfoExtended is required only for models that use it (Nano 5th/6th/7th gen).
+        // Classics and older nanos don't have it; requiring it would break them.
         const sysInfoExtendedPath = `${mountpoint}/iPod_Control/Device/SysInfoExtended`;
         let sysInfoExtendedVisible = false;
         try {
@@ -142,11 +143,15 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
         } catch (_) {
             // file missing
         }
-        if (!sysInfoExtendedVisible) {
+        const needsSysInfoExtended = options?.needsSysInfoExtended === true;
+        if (!sysInfoExtendedVisible && needsSysInfoExtended) {
             const msg = 'SysInfoExtended is not available. Ensure the selected folder is an iPod with Device/SysInfoExtended (e.g. Nano 7). Post-process commands will not run and the device may not show music correctly.';
             log(msg, 'error');
             console.error('[TunesReloaded]', msg);
             throw new Error(msg);
+        }
+        if (!sysInfoExtendedVisible && !needsSysInfoExtended) {
+            log('SysInfoExtended not present (not required for this model)', 'info');
         }
 
         log('Virtual filesystem ready', 'success');

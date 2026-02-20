@@ -430,5 +430,7 @@ export function createFirewireSetup({ log }) {
             const code = (cachedModelNumStr || '').slice(1, 5).toUpperCase();
             return HASHAB_MODEL_PREFIXES.has(code);
         },
+        /** True if the current device needs SysInfoExtended (e.g. Nano 5th/6th/7th gen with post-process commands). */
+        needsSysInfoExtended: () => !!getTemplateForModel(cachedModelNumStr),
     };
 }

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TunesReloaded</title>
+    <title>TunesReloaded Reworked</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Lucida+Grande:wght@400;700&display=swap" rel="stylesheet">
@@ -130,7 +130,7 @@
 
         /* Main container */
         .app-wrapper {
-            max-width: 1200px;
+            max-width: 1280px;
             margin: 0 auto;
             padding: 30px;
             min-height: 100vh;
@@ -317,6 +317,8 @@
         .content-area {
             padding: 20px;
             background: rgba(20, 20, 28, 0.4);
+            display: flex;
+            flex-direction: column;
         }
 
         .toolbar {
@@ -368,8 +370,9 @@
         /* Track table */
         .track-table-container {
             flex: 1;
+            min-height: 0;
             overflow: auto;
-            max-height: calc(100vh - 400px);
+            max-height: none;
         }
 
         .track-table {
@@ -756,12 +759,13 @@
             }
         }
     </style>
+  <script type="module" crossorigin src="/tunesreworked/assets/main-tDLtfsZw.js"></script>
 </head>
 <body>
     <!-- Welcome Overlay (first visit only) -->
     <div class="welcome-overlay hidden" id="welcomeOverlay">
         <div class="welcome-card">
-            <h1>TunesReloaded</h1>
+            <h1>TunesReloaded Reworked</h1>
             <p>
                 TunesReloaded is a platform that allows you to sync music with your 
                 iPod Classic without needing to use iTunes. 
@@ -777,7 +781,7 @@
         <!-- Header Banner -->
         <header class="header-banner">
             <div class="header-left">
-                <h1 class="app-title">TunesReloaded</h1>
+                <h1 class="app-title">TunesReloaded Reworked</h1>
                 <p class="app-tagline">Upload songs to your iPod directly with ease!</p>
             </div>
             <div class="header-right">
@@ -856,7 +860,7 @@
 
     <!-- Footer Banner -->
     <div class="bottom-banner" id="bottomBanner">
-        <a href="/about.html">About</a>
+        <a href="./about.html">About</a>
         <div class="bottom-banner-right">
             <button type="button" onclick="showBugReportModal()">Report Bug</button>
             <button type="button" onclick="showConsoleModal()">Console</button>
@@ -940,7 +944,8 @@
         <div class="modal">
             <h2>Browser Not Supported</h2>
             <p style="margin-bottom: 20px;">
-                Right now, TunesReloaded is only supported on Chrome/Chromium browsers.
+                TunesReloaded needs the File System Access API. In Brave, open <code>brave://flags/#file-system-access-api</code>,
+                enable the flag, relaunch Brave, then reload this page.
             </p>
             <div class="modal-actions" style="justify-content: center;">
                 <button class="btn btn-primary" onclick="hideBrowserCompatModal()">
@@ -991,7 +996,6 @@
     </div>
 
     <!-- music metadata is loaded via ESM import in modules/audio.js -->
-    <script src="/ipod_manager.js"></script>
-    <script type="module" src="/main.js"></script>
+    <script src="./ipod_manager.js"></script>
 </body>
 </html>
